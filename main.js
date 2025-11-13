@@ -11,6 +11,10 @@ class NetworkMonitor {
         this.sampleCount = 0;
         this.monitorInterval = null;
         this.isRunning = false;
+        this.maxFileSize = 8192;
+        this.highTrafficThreshold = 50 * 1024 * 1024;
+        this.errorThreshold = 1000;
+        this.dropThreshold = 100;
     }
 
     sanitizeInterfaceName(name) {
@@ -18,15 +22,75 @@ class NetworkMonitor {
             throw new Error('Interface name must be a non-empty string');
         }
         
-        if (name.includes('/') || name.includes('..') || name.length > 64) {
-            throw new Error('Invalid interface name');
+        const cleanName = name.trim();
+        if (cleanName.length === 0 || cleanName.length > 64) {
+            throw new Error('Interface name must be between 1 and 64 characters');
         }
         
-        if (!/^[a-zA-Z0-9\-_:.]+$/.test(name)) {
+        if (cleanName.includes('/') || cleanName.includes('..')) {
+            throw new Error('Interface name cannot contain path characters');
+        }
+        
+        if (!/^[a-zA-Z0-9\-_:.]+$/.test(cleanName)) {
             throw new Error('Interface name contains invalid characters');
         }
         
-        return name;
+        return cleanName;
+    }
+
+    validateSysfsPath(filePath) {
+        try {
+            const normalizedPath = path.normalize(filePath).replace(/\/+/g, '/');
+            
+            if (!normalizedPath.startsWith('/sys/class/net/')) {
+                return false;
+            }
+            
+            const pathAfterBase = normalizedPath.substring('/sys/class/net/'.length);
+            const parts = pathAfterBase.split('/');
+            
+            if (parts.length === 0) {
+                return false;
+            }
+            
+            const ifaceName = parts[0];
+            if (!ifaceName) {
+                return false;
+            }
+            
+            try {
+                this.sanitizeInterfaceName(ifaceName);
+            } catch {
+                return false;
+            }
+            
+            if (parts.length > 1) {
+                const filename = parts[1];
+                const allowedFiles = [
+                    'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets',
+                    'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped',
+                    'operstate', 'carrier', 'speed', 'mtu', 'statistics'
+                ];
+                if (!allowedFiles.includes(filename)) {
+                    return false;
+                }
+            }
+            
+            if (parts.length > 2) {
+                const subfile = parts[2];
+                const allowedSubfiles = [
+                    'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets',
+                    'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped'
+                ];
+                if (!allowedSubfiles.includes(subfile)) {
+                    return false;
+                }
+            }
+            
+            return true;
+        } catch (error) {
+            return false;
+        }
     }
 
     async start() {
@@ -34,8 +98,9 @@ class NetworkMonitor {
             throw new Error('Monitor is already running');
         }
 
+        console.log(`Checking interface ${this.interface}...`);
         if (!await this.interfaceExists()) {
-            throw new Error(`Interface ${this.interface} not found`);
+            throw new Error(`Interface ${this.interface} not found or not accessible`);
         }
 
         console.log(`Network Traffic Monitor - ${this.interface}`);
@@ -44,6 +109,7 @@ class NetworkMonitor {
 
         try {
             this.prevStats = await this.getNetworkStats();
+            console.log('Initial statistics loaded successfully');
         } catch (error) {
             throw new Error(`Failed to get initial stats: ${error.message}`);
         }
@@ -98,10 +164,14 @@ class NetworkMonitor {
             return;
         }
 
-        const txRate = Math.max(0, currentStats.txBytes - this.prevStats.txBytes);
-        const rxRate = Math.max(0, currentStats.rxBytes - this.prevStats.rxBytes);
-        const txPacketRate = Math.max(0, currentStats.txPackets - this.prevStats.txPackets);
-        const rxPacketRate = Math.max(0, currentStats.rxPackets - this.prevStats.rxPackets);
+        const txRate = this.calculateCounterDelta(this.prevStats.txBytes, currentStats.txBytes);
+        const rxRate = this.calculateCounterDelta(this.prevStats.rxBytes, currentStats.rxBytes);
+        const txPacketRate = this.calculateCounterDelta(this.prevStats.txPackets, currentStats.txPackets);
+        const rxPacketRate = this.calculateCounterDelta(this.prevStats.rxPackets, currentStats.rxPackets);
+        const txErrorsDelta = this.calculateCounterDelta(this.prevStats.txErrors, currentStats.txErrors);
+        const rxErrorsDelta = this.calculateCounterDelta(this.prevStats.rxErrors, currentStats.rxErrors);
+        const txDroppedDelta = this.calculateCounterDelta(this.prevStats.txDropped, currentStats.txDropped);
+        const rxDroppedDelta = this.calculateCounterDelta(this.prevStats.rxDropped, currentStats.rxDropped);
         
         const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
         
@@ -109,40 +179,15 @@ class NetworkMonitor {
         console.log(`  TX: ${this.formatBytes(txRate).padStart(8)}/s (${txPacketRate.toString().padStart(5)} pkt/s) | Total: ${this.formatBytes(currentStats.txBytes)}`);
         console.log(`  RX: ${this.formatBytes(rxRate).padStart(8)}/s (${rxPacketRate.toString().padStart(5)} pkt/s) | Total: ${this.formatBytes(currentStats.rxBytes)}`);
         
-        const txErrorsDelta = Math.max(0, currentStats.txErrors - this.prevStats.txErrors);
-        const rxErrorsDelta = Math.max(0, currentStats.rxErrors - this.prevStats.rxErrors);
-        
         if (txErrorsDelta > 0 || rxErrorsDelta > 0) {
             console.log(`  ERRORS: TX=${txErrorsDelta}, RX=${rxErrorsDelta}`);
         }
-        
-        const txDroppedDelta = Math.max(0, currentStats.txDropped - this.prevStats.txDropped);
-        const rxDroppedDelta = Math.max(0, currentStats.rxDropped - this.prevStats.rxDropped);
         
         if (txDroppedDelta > 0 || rxDroppedDelta > 0) {
             console.log(`  DROPPED: TX=${txDroppedDelta}, RX=${rxDroppedDelta}`);
         }
 
-        const highTrafficThreshold = 50 * 1024 * 1024;
-        if (txRate > highTrafficThreshold) {
-            this.alerts.push({
-                timestamp: new Date(),
-                type: 'HIGH_TX',
-                rate: txRate,
-                interface: this.interface
-            });
-            console.log('  ⚠️  HIGH TX TRAFFIC DETECTED');
-        }
-        
-        if (rxRate > highTrafficThreshold) {
-            this.alerts.push({
-                timestamp: new Date(),
-                type: 'HIGH_RX',
-                rate: rxRate,
-                interface: this.interface
-            });
-            console.log('  ⚠️  HIGH RX TRAFFIC DETECTED');
-        }
+        this.checkAlerts(txRate, rxRate, txErrorsDelta, rxErrorsDelta, txDroppedDelta, rxDroppedDelta);
         
         if (txRate === 0 && rxRate === 0) {
             console.log('  No network activity');
@@ -157,6 +202,82 @@ class NetworkMonitor {
 
         this.prevStats = currentStats;
         this.sampleCount++;
+    }
+
+    calculateCounterDelta(prev, curr) {
+        const maxValue = Number.MAX_SAFE_INTEGER;
+        
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return (maxValue - prev) + curr;
+        }
+    }
+
+    checkAlerts(txRate, rxRate, txErrors, rxErrors, txDropped, rxDropped) {
+        if (txRate > this.highTrafficThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_TX_TRAFFIC',
+                rate: txRate,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH TX TRAFFIC DETECTED');
+        }
+        
+        if (rxRate > this.highTrafficThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_RX_TRAFFIC',
+                rate: rxRate,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH RX TRAFFIC DETECTED');
+        }
+
+        if (txErrors > this.errorThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_TX_ERRORS',
+                count: txErrors,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH TX ERRORS DETECTED');
+        }
+
+        if (rxErrors > this.errorThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_RX_ERRORS',
+                count: rxErrors,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH RX ERRORS DETECTED');
+        }
+
+        if (txDropped > this.dropThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_TX_DROPPED',
+                count: txDropped,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH TX DROPPED PACKETS');
+        }
+
+        if (rxDropped > this.dropThreshold) {
+            this.alerts.push({
+                timestamp: new Date(),
+                type: 'HIGH_RX_DROPPED',
+                count: rxDropped,
+                interface: this.interface
+            });
+            console.log('  ALERT: HIGH RX DROPPED PACKETS');
+        }
+
+        if (this.alerts.length > 100) {
+            this.alerts = this.alerts.slice(-50);
+        }
     }
 
     async getNetworkStats() {
@@ -180,7 +301,12 @@ class NetworkMonitor {
 
         for (const [statName, fileName] of Object.entries(statsFiles)) {
             const filePath = path.join(basePath, fileName);
-            stats[statName] = await this.readSysFile(filePath);
+            try {
+                stats[statName] = await this.readSysFile(filePath);
+            } catch (error) {
+                console.error(`Failed to read ${fileName}: ${error.message}`);
+                stats[statName] = 0;
+            }
         }
         
         return stats;
@@ -188,9 +314,13 @@ class NetworkMonitor {
 
     async readSysFile(filePath) {
         try {
-            const resolvedPath = path.resolve(filePath);
-            if (!resolvedPath.startsWith('/sys/class/net/')) {
-                throw new Error('Invalid file path');
+            if (!this.validateSysfsPath(filePath)) {
+                throw new Error(`Invalid file path: ${filePath}`);
+            }
+
+            const stats = await fs.promises.stat(filePath);
+            if (stats.size > this.maxFileSize) {
+                throw new Error('File too large');
             }
 
             const data = await fs.promises.readFile(filePath, 'utf8');
@@ -205,18 +335,33 @@ class NetworkMonitor {
             if (error.code === 'ENOENT') {
                 throw new Error(`Network statistics not available for interface ${this.interface}`);
             }
-            return 0;
+            if (error.code === 'EACCES') {
+                throw new Error(`Permission denied reading statistics for ${this.interface}`);
+            }
+            throw error;
         }
     }
 
     async interfaceExists() {
         try {
             const interfacePath = `/sys/class/net/${this.interface}`;
-            await fs.promises.access(interfacePath);
             
+            if (!this.validateSysfsPath(interfacePath)) {
+                console.log(`Path validation failed for: ${interfacePath}`);
+                return false;
+            }
+
+            await fs.promises.access(interfacePath);
             const stats = await fs.promises.stat(interfacePath);
-            return stats.isDirectory();
-        } catch {
+            
+            if (!stats.isDirectory()) {
+                console.log(`Interface path is not a directory: ${interfacePath}`);
+                return false;
+            }
+            
+            return true;
+        } catch (error) {
+            console.log(`Interface check failed for ${this.interface}: ${error.message}`);
             return false;
         }
     }
@@ -245,33 +390,88 @@ class NetworkMonitor {
         }
 
         const elapsed = (Date.now() - this.startTime) / 1000;
-        console.log('\n=== Monitoring Summary ===');
+        console.log('\n' + '='.repeat(40));
+        console.log('MONITORING SUMMARY');
+        console.log('='.repeat(40));
         console.log(`Interface: ${this.interface}`);
         console.log(`Duration: ${elapsed.toFixed(1)} seconds`);
         console.log(`Samples: ${this.sampleCount}`);
         
         if (this.alerts.length > 0) {
             console.log(`\nAlerts triggered: ${this.alerts.length}`);
+            const alertTypes = {};
             this.alerts.forEach(alert => {
                 const timeStr = alert.timestamp.toISOString().substring(11, 19);
-                console.log(`  [${timeStr}] ${alert.type}: ${this.formatBytes(alert.rate)}/s`);
+                alertTypes[alert.type] = (alertTypes[alert.type] || 0) + 1;
+                const value = alert.rate ? this.formatBytes(alert.rate) + '/s' : alert.count + ' packets';
+                console.log(`  [${timeStr}] ${alert.type}: ${value}`);
             });
+            
+            console.log('\nAlert summary:');
+            Object.entries(alertTypes).forEach(([type, count]) => {
+                console.log(`  ${type}: ${count} times`);
+            });
+        } else {
+            console.log('\nNo alerts triggered');
         }
         
         console.log(`\nFinal totals for ${this.interface}:`);
-        console.log(`  TX: ${this.formatBytes(this.prevStats.txBytes)} (${this.prevStats.txPackets} packets, ${this.prevStats.txErrors} errors, ${this.prevStats.txDropped} dropped)`);
-        console.log(`  RX: ${this.formatBytes(this.prevStats.rxBytes)} (${this.prevStats.rxPackets} packets, ${this.prevStats.rxErrors} errors, ${this.prevStats.rxDropped} dropped)`);
+        console.log(`  TX: ${this.formatBytes(this.prevStats.txBytes)}`);
+        console.log(`     Packets: ${this.prevStats.txPackets.toLocaleString()}`);
+        console.log(`     Errors: ${this.prevStats.txErrors.toLocaleString()}`);
+        console.log(`     Dropped: ${this.prevStats.txDropped.toLocaleString()}`);
+        
+        console.log(`  RX: ${this.formatBytes(this.prevStats.rxBytes)}`);
+        console.log(`     Packets: ${this.prevStats.rxPackets.toLocaleString()}`);
+        console.log(`     Errors: ${this.prevStats.rxErrors.toLocaleString()}`);
+        console.log(`     Dropped: ${this.prevStats.rxDropped.toLocaleString()}`);
         
         const totalBytes = this.prevStats.txBytes + this.prevStats.rxBytes;
         const totalPackets = this.prevStats.txPackets + this.prevStats.rxPackets;
-        console.log(`  TOTAL: ${this.formatBytes(totalBytes)} (${totalPackets} packets)`);
+        const totalErrors = this.prevStats.txErrors + this.prevStats.rxErrors;
+        const totalDropped = this.prevStats.txDropped + this.prevStats.rxDropped;
+        
+        console.log(`\nTOTALS:`);
+        console.log(`  Data: ${this.formatBytes(totalBytes)}`);
+        console.log(`  Packets: ${totalPackets.toLocaleString()}`);
+        console.log(`  Errors: ${totalErrors.toLocaleString()}`);
+        console.log(`  Dropped: ${totalDropped.toLocaleString()}`);
+        
+        if (elapsed > 0) {
+            const avgTxRate = this.prevStats.txBytes / elapsed;
+            const avgRxRate = this.prevStats.rxBytes / elapsed;
+            console.log(`\nAVERAGE RATES:`);
+            console.log(`  TX: ${this.formatBytes(avgTxRate)}/s`);
+            console.log(`  RX: ${this.formatBytes(avgRxRate)}/s`);
+            
+            if (totalPackets > 0) {
+                const avgPacketSize = totalBytes / totalPackets;
+                console.log(`  Avg packet size: ${Math.round(avgPacketSize)} bytes`);
+            }
+            
+            if (totalErrors > 0 && totalPackets > 0) {
+                const errorRate = (totalErrors / totalPackets) * 100;
+                console.log(`  Error rate: ${errorRate.toFixed(4)}%`);
+            }
+        }
     }
 }
 
 async function listInterfaces() {
     try {
         const interfacesPath = '/sys/class/net';
+        
+        try {
+            await fs.promises.access(interfacesPath);
+            console.log(`Interfaces directory exists: ${interfacesPath}`);
+        } catch (error) {
+            console.log(`Cannot access network interfaces directory: ${interfacesPath}`);
+            console.log(`Error: ${error.message}`);
+            return [];
+        }
+
         const interfaces = await fs.promises.readdir(interfacesPath);
+        console.log(`Found ${interfaces.length} potential interfaces`);
         
         const validInterfaces = [];
         for (const iface of interfaces) {
@@ -280,14 +480,22 @@ async function listInterfaces() {
                 const stats = await fs.promises.stat(ifacePath);
                 if (stats.isDirectory()) {
                     validInterfaces.push(iface);
+                    console.log(`  ✓ ${iface}`);
+                } else {
+                    console.log(`  ✗ ${iface} (not a directory)`);
                 }
-            } catch {
+            } catch (error) {
+                console.log(`  ✗ ${iface} (error: ${error.message})`);
                 continue;
             }
         }
         
-        console.log('Available interfaces:');
-        validInterfaces.forEach(iface => console.log(`  - ${iface}`));
+        console.log(`\nAvailable interfaces: ${validInterfaces.length}`);
+        if (validInterfaces.length === 0) {
+            console.log('  No valid interfaces found');
+        } else {
+            validInterfaces.forEach(iface => console.log(`  - ${iface}`));
+        }
         return validInterfaces;
     } catch (error) {
         console.log('Cannot list interfaces:', error.message);
@@ -295,15 +503,34 @@ async function listInterfaces() {
     }
 }
 
+async function validateInterface(interfaceName) {
+    try {
+        const monitor = new NetworkMonitor(interfaceName);
+        const exists = await monitor.interfaceExists();
+        console.log(`Interface ${interfaceName} exists: ${exists}`);
+        return exists;
+    } catch (error) {
+        console.log(`Interface validation failed for ${interfaceName}: ${error.message}`);
+        return false;
+    }
+}
+
 async function main() {
     const args = process.argv.slice(2);
     
     if (args.length < 1 || args.includes('--help') || args.includes('-h')) {
+        console.log('Network Traffic Monitor');
         console.log('Usage: node network_monitor.js <interface> [duration_seconds]');
-        console.log('Options:');
-        console.log('  --help, -h    Show this help message');
-        console.log('  --list, -l    List available interfaces');
-        await listInterfaces();
+        console.log('\nOptions:');
+        console.log('  --help, -h       Show this help message');
+        console.log('  --list, -l       List available interfaces');
+        console.log('  --threshold N    Set high traffic threshold in MB (default: 50)');
+        console.log('  --errors N       Set error threshold (default: 1000)');
+        console.log('  --drops N        Set dropped packet threshold (default: 100)');
+        console.log('\nExamples:');
+        console.log('  node network_monitor.js eth0 60');
+        console.log('  node network_monitor.js wlan0 --threshold 100 --errors 500');
+        console.log('  node network_monitor.js --list');
         return;
     }
 
@@ -313,14 +540,42 @@ async function main() {
     }
 
     const interfaceName = args[0];
-    const duration = args[1] ? parseInt(args[1], 10) : 0;
+    let duration = 0;
+    let highTrafficThreshold = 50;
+    let errorThreshold = 1000;
+    let dropThreshold = 100;
+
+    for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--threshold' && args[i + 1]) {
+            highTrafficThreshold = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--errors' && args[i + 1]) {
+            errorThreshold = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--drops' && args[i + 1]) {
+            dropThreshold = parseInt(args[i + 1], 10);
+            i++;
+        } else if (!isNaN(parseInt(args[i], 10))) {
+            duration = parseInt(args[i], 10);
+        }
+    }
 
     if (isNaN(duration) || duration < 0) {
         console.error('Error: Duration must be a non-negative number');
         process.exit(1);
     }
 
+    console.log(`Validating interface: ${interfaceName}`);
+    if (!await validateInterface(interfaceName)) {
+        console.error(`Error: Interface '${interfaceName}' not found or not accessible`);
+        console.log('Use --list to see available interfaces');
+        process.exit(1);
+    }
+
     const monitor = new NetworkMonitor(interfaceName, duration);
+    monitor.highTrafficThreshold = highTrafficThreshold * 1024 * 1024;
+    monitor.errorThreshold = errorThreshold;
+    monitor.dropThreshold = dropThreshold;
     
     let sigintHandler;
     process.on('SIGINT', sigintHandler = () => {
