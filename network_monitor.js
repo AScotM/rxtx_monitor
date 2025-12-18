@@ -11,12 +11,14 @@ class NetworkMonitor {
         this.sampleCount = 0;
         this.monitorInterval = null;
         this.isRunning = false;
-        this.maxFileSize = 8192;
+        this.maxFileSize = 16384;
         this.highTrafficThreshold = 50 * 1024 * 1024;
         this.errorThreshold = 1000;
         this.dropThreshold = 100;
         this.sampleInterval = 1000;
         this.alertHistorySize = 100;
+        this.durationTimeout = null;
+        this.currentSamplePromise = null;
     }
 
     sanitizeInterfaceName(name) {
@@ -33,8 +35,8 @@ class NetworkMonitor {
             throw new Error('Interface name cannot contain path characters');
         }
         
-        if (!/^[a-zA-Z0-9\-_:.]+$/.test(cleanName)) {
-            throw new Error('Interface name contains invalid characters');
+        if (!/^[a-z0-9]+[a-z0-9\-_:.]*$/i.test(cleanName)) {
+            throw new Error('Interface name must start with alphanumeric and contain only letters, numbers, hyphens, underscores, colons, or dots');
         }
         
         return cleanName;
@@ -45,21 +47,21 @@ class NetworkMonitor {
             const normalizedPath = path.normalize(filePath).replace(/\/+/g, '/');
             
             if (!normalizedPath.startsWith('/sys/class/net/')) {
-                return false;
+                return { valid: false, reason: 'Path must start with /sys/class/net/' };
             }
             
             const pathAfterBase = normalizedPath.substring('/sys/class/net/'.length);
             const parts = pathAfterBase.split('/').filter(part => part.length > 0);
             
             if (parts.length === 0) {
-                return false;
+                return { valid: false, reason: 'No interface specified' };
             }
             
             const ifaceName = parts[0];
             try {
                 this.sanitizeInterfaceName(ifaceName);
-            } catch {
-                return false;
+            } catch (error) {
+                return { valid: false, reason: `Invalid interface name: ${error.message}` };
             }
             
             const allowedFiles = new Set([
@@ -71,7 +73,7 @@ class NetworkMonitor {
             if (parts.length > 1) {
                 const filename = parts[1];
                 if (!allowedFiles.has(filename)) {
-                    return false;
+                    return { valid: false, reason: `File ${filename} not allowed in sysfs` };
                 }
             }
             
@@ -82,13 +84,17 @@ class NetworkMonitor {
                     'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped'
                 ]);
                 if (!allowedSubfiles.has(subfile)) {
-                    return false;
+                    return { valid: false, reason: `Subfile ${subfile} not allowed` };
                 }
             }
             
-            return parts.length <= 3;
+            if (parts.length > 3) {
+                return { valid: false, reason: 'Path too deep' };
+            }
+            
+            return { valid: true };
         } catch (error) {
-            return false;
+            return { valid: false, reason: `Validation error: ${error.message}` };
         }
     }
 
@@ -98,13 +104,15 @@ class NetworkMonitor {
         }
 
         console.log(`Checking interface ${this.interface}...`);
-        if (!await this.interfaceExists()) {
+        const exists = await this.interfaceExists();
+        if (!exists) {
             throw new Error(`Interface ${this.interface} not found or not accessible`);
         }
 
         console.log(`Network Traffic Monitor - ${this.interface}`);
         console.log(`Duration: ${this.duration > 0 ? this.duration + ' seconds' : 'unlimited'}`);
         console.log(`Sample interval: ${this.sampleInterval}ms`);
+        console.log(`High traffic threshold: ${this.formatBytes(this.highTrafficThreshold)}/s`);
         console.log('Press Ctrl+C to stop\n');
 
         try {
@@ -116,13 +124,19 @@ class NetworkMonitor {
 
         this.isRunning = true;
         this.startTime = Date.now();
+        this.sampleCount = 0;
+        this.alerts = [];
         
         this.monitorInterval = setInterval(async () => {
-            try {
-                await this.sample();
-            } catch (error) {
-                console.error(`Sampling error: ${error.message}`);
+            if (!this.isRunning || this.currentSamplePromise) {
+                return;
             }
+            
+            this.currentSamplePromise = this.sample().catch(error => {
+                console.error(`Sampling error: ${error.message}`);
+            }).finally(() => {
+                this.currentSamplePromise = null;
+            });
         }, this.sampleInterval);
 
         if (this.duration > 0) {
@@ -146,6 +160,22 @@ class NetworkMonitor {
         }
         
         this.printSummary();
+        
+        this.prevStats = null;
+        this.sampleCount = 0;
+    }
+
+    pause() {
+        this.isRunning = false;
+        console.log('Monitoring paused');
+    }
+
+    resume() {
+        if (!this.prevStats) {
+            throw new Error('Cannot resume - no previous statistics');
+        }
+        this.isRunning = true;
+        console.log('Monitoring resumed');
     }
 
     async sample() {
@@ -204,12 +234,15 @@ class NetworkMonitor {
     }
 
     calculateCounterDelta(prev, curr) {
-        const maxValue = 0xFFFFFFFFFFFFF;
+        const MAX_UINT64 = 0xFFFFFFFFFFFFFFFFn;
         
-        if (curr >= prev) {
-            return curr - prev;
+        const prevBig = BigInt(prev);
+        const currBig = BigInt(curr);
+        
+        if (currBig >= prevBig) {
+            return Number(currBig - prevBig);
         } else {
-            return (maxValue - prev) + curr + 1;
+            return Number((MAX_UINT64 - prevBig) + currBig + 1n);
         }
     }
 
@@ -223,7 +256,7 @@ class NetworkMonitor {
                 rate: txRate,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH TX TRAFFIC DETECTED');
+            console.log(`  ALERT: HIGH TX TRAFFIC DETECTED (${this.formatBytes(txRate)}/s)`);
         }
         
         if (rxRate > this.highTrafficThreshold) {
@@ -233,7 +266,7 @@ class NetworkMonitor {
                 rate: rxRate,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH RX TRAFFIC DETECTED');
+            console.log(`  ALERT: HIGH RX TRAFFIC DETECTED (${this.formatBytes(rxRate)}/s)`);
         }
 
         if (txErrors > this.errorThreshold) {
@@ -243,7 +276,7 @@ class NetworkMonitor {
                 count: txErrors,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH TX ERRORS DETECTED');
+            console.log(`  ALERT: HIGH TX ERRORS DETECTED (${txErrors} errors)`);
         }
 
         if (rxErrors > this.errorThreshold) {
@@ -253,7 +286,7 @@ class NetworkMonitor {
                 count: rxErrors,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH RX ERRORS DETECTED');
+            console.log(`  ALERT: HIGH RX ERRORS DETECTED (${rxErrors} errors)`);
         }
 
         if (txDropped > this.dropThreshold) {
@@ -263,7 +296,7 @@ class NetworkMonitor {
                 count: txDropped,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH TX DROPPED PACKETS');
+            console.log(`  ALERT: HIGH TX DROPPED PACKETS (${txDropped} dropped)`);
         }
 
         if (rxDropped > this.dropThreshold) {
@@ -273,14 +306,14 @@ class NetworkMonitor {
                 count: rxDropped,
                 interface: this.interface
             });
-            console.log('  ALERT: HIGH RX DROPPED PACKETS');
+            console.log(`  ALERT: HIGH RX DROPPED PACKETS (${rxDropped} dropped)`);
         }
     }
 
     addAlert(alert) {
         this.alerts.push(alert);
         if (this.alerts.length > this.alertHistorySize) {
-            this.alerts = this.alerts.slice(-Math.floor(this.alertHistorySize / 2));
+            this.alerts.shift();
         }
     }
 
@@ -303,28 +336,35 @@ class NetworkMonitor {
             timestamp: Date.now()
         };
 
+        const readPromises = [];
+        const filePaths = [];
+
         for (const [statName, fileName] of Object.entries(statsFiles)) {
             const filePath = path.join(basePath, fileName);
-            try {
-                stats[statName] = await this.readSysFile(filePath);
-            } catch (error) {
-                console.error(`Failed to read ${fileName}: ${error.message}`);
-                stats[statName] = 0;
-            }
+            filePaths.push({ statName, filePath });
+            readPromises.push(this.readSysFile(filePath).catch(() => 0));
         }
+
+        const results = await Promise.all(readPromises);
+        
+        results.forEach((value, index) => {
+            const { statName } = filePaths[index];
+            stats[statName] = value;
+        });
         
         return stats;
     }
 
     async readSysFile(filePath) {
         try {
-            if (!this.validateSysfsPath(filePath)) {
-                throw new Error(`Invalid file path: ${filePath}`);
+            const validation = this.validateSysfsPath(filePath);
+            if (!validation.valid) {
+                throw new Error(validation.reason);
             }
 
             const stats = await fs.promises.stat(filePath);
             if (stats.size > this.maxFileSize) {
-                throw new Error('File too large');
+                throw new Error(`File too large: ${stats.size} bytes`);
             }
 
             const data = await fs.promises.readFile(filePath, 'utf8');
@@ -350,7 +390,9 @@ class NetworkMonitor {
         try {
             const interfacePath = `/sys/class/net/${this.interface}`;
             
-            if (!this.validateSysfsPath(interfacePath)) {
+            const validation = this.validateSysfsPath(interfacePath);
+            if (!validation.valid) {
+                console.error(`Invalid interface path: ${validation.reason}`);
                 return false;
             }
 
@@ -358,11 +400,13 @@ class NetworkMonitor {
             const stats = await fs.promises.stat(interfacePath);
             
             if (!stats.isDirectory()) {
+                console.error(`Interface path is not a directory: ${interfacePath}`);
                 return false;
             }
             
             return true;
         } catch (error) {
+            console.error(`Interface check failed: ${error.message}`);
             return false;
         }
     }
@@ -404,7 +448,7 @@ class NetworkMonitor {
             this.alerts.forEach(alert => {
                 const timeStr = alert.timestamp.toISOString().substring(11, 19);
                 alertTypes[alert.type] = (alertTypes[alert.type] || 0) + 1;
-                const value = alert.rate ? this.formatBytes(alert.rate) + '/s' : alert.count + ' packets';
+                const value = alert.rate ? `${this.formatBytes(alert.rate)}/s` : `${alert.count} packets`;
                 console.log(`  [${timeStr}] ${alert.type}: ${value}`);
             });
             
@@ -456,6 +500,25 @@ class NetworkMonitor {
             }
         }
     }
+
+    exportToJson() {
+        return {
+            interface: this.interface,
+            startTime: new Date(this.startTime).toISOString(),
+            sampleCount: this.sampleCount,
+            alerts: this.alerts.map(alert => ({
+                ...alert,
+                timestamp: alert.timestamp.toISOString()
+            })),
+            finalStats: this.prevStats,
+            settings: {
+                highTrafficThreshold: this.highTrafficThreshold,
+                errorThreshold: this.errorThreshold,
+                dropThreshold: this.dropThreshold,
+                sampleInterval: this.sampleInterval
+            }
+        };
+    }
 }
 
 async function listInterfaces() {
@@ -496,6 +559,14 @@ async function validateInterface(interfaceName) {
     }
 }
 
+function validatePositiveNumber(value, name, min = 1) {
+    const num = parseInt(value, 10);
+    if (isNaN(num) || num < min) {
+        throw new Error(`${name} must be a number >= ${min}`);
+    }
+    return num;
+}
+
 async function main() {
     const args = process.argv.slice(2);
     
@@ -509,6 +580,7 @@ async function main() {
         console.log('  --errors N       Set error threshold (default: 1000)');
         console.log('  --drops N        Set dropped packet threshold (default: 100)');
         console.log('  --interval N     Set sample interval in ms (default: 1000)');
+        console.log('  --json           Output summary in JSON format');
         console.log('\nExamples:');
         console.log('  node network_monitor.js eth0 60');
         console.log('  node network_monitor.js wlan0 --threshold 100 --errors 500');
@@ -527,22 +599,25 @@ async function main() {
     let errorThreshold = 1000;
     let dropThreshold = 100;
     let sampleInterval = 1000;
+    let outputJson = false;
 
     for (let i = 1; i < args.length; i++) {
         if (args[i] === '--threshold' && args[i + 1]) {
-            highTrafficThreshold = parseInt(args[i + 1], 10);
+            highTrafficThreshold = validatePositiveNumber(args[i + 1], 'Threshold', 1);
             i++;
         } else if (args[i] === '--errors' && args[i + 1]) {
-            errorThreshold = parseInt(args[i + 1], 10);
+            errorThreshold = validatePositiveNumber(args[i + 1], 'Error threshold', 0);
             i++;
         } else if (args[i] === '--drops' && args[i + 1]) {
-            dropThreshold = parseInt(args[i + 1], 10);
+            dropThreshold = validatePositiveNumber(args[i + 1], 'Drop threshold', 0);
             i++;
         } else if (args[i] === '--interval' && args[i + 1]) {
-            sampleInterval = parseInt(args[i + 1], 10);
+            sampleInterval = validatePositiveNumber(args[i + 1], 'Sample interval', 100);
             i++;
+        } else if (args[i] === '--json') {
+            outputJson = true;
         } else if (!isNaN(parseInt(args[i], 10))) {
-            duration = parseInt(args[i], 10);
+            duration = validatePositiveNumber(args[i], 'Duration', 0);
         }
     }
 
@@ -556,11 +631,14 @@ async function main() {
     monitor.highTrafficThreshold = highTrafficThreshold * 1024 * 1024;
     monitor.errorThreshold = errorThreshold;
     monitor.dropThreshold = dropThreshold;
-    monitor.sampleInterval = Math.max(100, sampleInterval);
+    monitor.sampleInterval = sampleInterval;
     
     const sigintHandler = () => {
         console.log('\nStopping monitor...');
         monitor.stop();
+        if (outputJson) {
+            console.log(JSON.stringify(monitor.exportToJson(), null, 2));
+        }
         process.exit(0);
     };
 
