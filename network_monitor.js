@@ -1,8 +1,10 @@
 const fs = require('fs');
 const path = require('path');
+const EventEmitter = require('events');
 
-class NetworkMonitor {
+class NetworkMonitor extends EventEmitter {
     constructor(interfaceName, duration = 0) {
+        super();
         this.interface = this.sanitizeInterfaceName(interfaceName);
         this.duration = Math.max(0, duration);
         this.startTime = Date.now();
@@ -19,6 +21,8 @@ class NetworkMonitor {
         this.alertHistorySize = 100;
         this.durationTimeout = null;
         this.currentSamplePromise = null;
+        this.lastAlertTimestamps = new Map();
+        this.alertCooldown = 5000;
     }
 
     sanitizeInterfaceName(name) {
@@ -126,17 +130,27 @@ class NetworkMonitor {
         this.startTime = Date.now();
         this.sampleCount = 0;
         this.alerts = [];
+        this.lastAlertTimestamps.clear();
         
-        this.monitorInterval = setInterval(async () => {
-            if (!this.isRunning || this.currentSamplePromise) {
+        this.monitorInterval = setInterval(() => {
+            if (!this.isRunning) {
                 return;
             }
             
-            this.currentSamplePromise = this.sample().catch(error => {
-                console.error(`Sampling error: ${error.message}`);
-            }).finally(() => {
-                this.currentSamplePromise = null;
-            });
+            if (this.currentSamplePromise) {
+                return;
+            }
+            
+            this.currentSamplePromise = (async () => {
+                try {
+                    await this.sample();
+                } catch (error) {
+                    console.error(`Sampling error: ${error.message}`);
+                    this.emit('error', error);
+                } finally {
+                    this.currentSamplePromise = null;
+                }
+            })();
         }, this.sampleInterval);
 
         if (this.duration > 0) {
@@ -144,9 +158,15 @@ class NetworkMonitor {
                 this.stop();
             }, this.duration * 1000);
         }
+
+        this.emit('started');
     }
 
     stop() {
+        if (!this.isRunning) {
+            return;
+        }
+        
         this.isRunning = false;
         
         if (this.monitorInterval) {
@@ -159,34 +179,49 @@ class NetworkMonitor {
             this.durationTimeout = null;
         }
         
+        if (this.currentSamplePromise) {
+            this.currentSamplePromise.catch(() => {});
+        }
+        
         this.printSummary();
         
-        this.prevStats = null;
-        this.sampleCount = 0;
+        this.emit('stopped');
     }
 
     pause() {
+        if (!this.isRunning) {
+            return;
+        }
         this.isRunning = false;
         console.log('Monitoring paused');
+        this.emit('paused');
     }
 
     resume() {
+        if (this.isRunning) {
+            return;
+        }
+        
         if (!this.prevStats) {
             throw new Error('Cannot resume - no previous statistics');
         }
+        
         this.isRunning = true;
         console.log('Monitoring resumed');
+        this.emit('resumed');
     }
 
     async sample() {
-        if (!this.isRunning) return;
+        if (!this.isRunning) {
+            return;
+        }
 
         let currentStats;
         try {
             currentStats = await this.getNetworkStats();
         } catch (error) {
-            console.error(`Failed to get network stats: ${error.message}`);
-            return;
+            this.emit('error', error);
+            throw error;
         }
 
         if (!this.prevStats) {
@@ -203,6 +238,22 @@ class NetworkMonitor {
         const rxErrorsDelta = this.calculateCounterDelta(this.prevStats.rxErrors, currentStats.rxErrors);
         const txDroppedDelta = this.calculateCounterDelta(this.prevStats.txDropped, currentStats.txDropped);
         const rxDroppedDelta = this.calculateCounterDelta(this.prevStats.rxDropped, currentStats.rxDropped);
+        
+        const sampleData = {
+            timestamp: new Date(),
+            interface: this.interface,
+            txRate,
+            rxRate,
+            txPacketRate,
+            rxPacketRate,
+            txErrorsDelta,
+            rxErrorsDelta,
+            txDroppedDelta,
+            rxDroppedDelta,
+            currentStats
+        };
+        
+        this.emit('sample', sampleData);
         
         console.log(`[${timestamp}] ${this.interface}`);
         console.log(`  TX: ${this.formatBytes(txRate).padStart(8)}/s (${txPacketRate.toString().padStart(5)} pkt/s) | Total: ${this.formatBytes(currentStats.txBytes)}`);
@@ -234,85 +285,98 @@ class NetworkMonitor {
     }
 
     calculateCounterDelta(prev, curr) {
-        const MAX_UINT64 = 0xFFFFFFFFFFFFFFFFn;
+        const prevNum = Number(prev);
+        const currNum = Number(curr);
         
-        const prevBig = BigInt(prev);
-        const currBig = BigInt(curr);
-        
-        if (currBig >= prevBig) {
-            return Number(currBig - prevBig);
-        } else {
-            return Number((MAX_UINT64 - prevBig) + currBig + 1n);
+        if (currNum >= prevNum) {
+            return currNum - prevNum;
         }
+        
+        const MAX_UINT32 = 0xFFFFFFFF;
+        if (prevNum > MAX_UINT32 || currNum > MAX_UINT32) {
+            const prevBig = BigInt(prev);
+            const currBig = BigInt(curr);
+            const MAX_UINT64 = 0xFFFFFFFFFFFFFFFFn;
+            
+            if (currBig >= prevBig) {
+                return Number(currBig - prevBig);
+            } else {
+                return Number((MAX_UINT64 - prevBig) + currBig + 1n);
+            }
+        }
+        
+        return (MAX_UINT32 - prevNum) + currNum + 1;
     }
 
     checkAlerts(txRate, rxRate, txErrors, rxErrors, txDropped, rxDropped) {
-        const timestamp = new Date();
+        const now = Date.now();
+        const checkAndAddAlert = (type, condition, details) => {
+            if (!condition) {
+                return;
+            }
+            
+            const lastAlert = this.lastAlertTimestamps.get(type) || 0;
+            if (now - lastAlert < this.alertCooldown) {
+                return;
+            }
+            
+            const alert = {
+                timestamp: new Date(now),
+                type,
+                ...details,
+                interface: this.interface
+            };
+            
+            this.addAlert(alert);
+            this.lastAlertTimestamps.set(type, now);
+            this.emit('alert', alert);
+            
+            return alert;
+        };
+
+        const txAlert = checkAndAddAlert('HIGH_TX_TRAFFIC', 
+            txRate > this.highTrafficThreshold, 
+            { rate: txRate }
+        );
         
-        if (txRate > this.highTrafficThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_TX_TRAFFIC',
-                rate: txRate,
-                interface: this.interface
-            });
-            console.log(`  ALERT: HIGH TX TRAFFIC DETECTED (${this.formatBytes(txRate)}/s)`);
-        }
-        
-        if (rxRate > this.highTrafficThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_RX_TRAFFIC',
-                rate: rxRate,
-                interface: this.interface
-            });
-            console.log(`  ALERT: HIGH RX TRAFFIC DETECTED (${this.formatBytes(rxRate)}/s)`);
-        }
+        const rxAlert = checkAndAddAlert('HIGH_RX_TRAFFIC',
+            rxRate > this.highTrafficThreshold,
+            { rate: rxRate }
+        );
 
-        if (txErrors > this.errorThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_TX_ERRORS',
-                count: txErrors,
-                interface: this.interface
-            });
-            console.log(`  ALERT: HIGH TX ERRORS DETECTED (${txErrors} errors)`);
-        }
+        const txErrorAlert = checkAndAddAlert('HIGH_TX_ERRORS',
+            txErrors > this.errorThreshold,
+            { count: txErrors }
+        );
 
-        if (rxErrors > this.errorThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_RX_ERRORS',
-                count: rxErrors,
-                interface: this.interface
-            });
-            console.log(`  ALERT: HIGH RX ERRORS DETECTED (${rxErrors} errors)`);
-        }
+        const rxErrorAlert = checkAndAddAlert('HIGH_RX_ERRORS',
+            rxErrors > this.errorThreshold,
+            { count: rxErrors }
+        );
 
-        if (txDropped > this.dropThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_TX_DROPPED',
-                count: txDropped,
-                interface: this.interface
-            });
-            console.log(`  ALERT: HIGH TX DROPPED PACKETS (${txDropped} dropped)`);
-        }
+        const txDropAlert = checkAndAddAlert('HIGH_TX_DROPPED',
+            txDropped > this.dropThreshold,
+            { count: txDropped }
+        );
 
-        if (rxDropped > this.dropThreshold) {
-            this.addAlert({
-                timestamp,
-                type: 'HIGH_RX_DROPPED',
-                count: rxDropped,
-                interface: this.interface
+        const rxDropAlert = checkAndAddAlert('HIGH_RX_DROPPED',
+            rxDropped > this.dropThreshold,
+            { count: rxDropped }
+        );
+
+        [txAlert, rxAlert, txErrorAlert, rxErrorAlert, txDropAlert, rxDropAlert]
+            .filter(alert => alert)
+            .forEach(alert => {
+                const value = alert.rate ? 
+                    `${this.formatBytes(alert.rate)}/s` : 
+                    `${alert.count} packets`;
+                console.log(`  ALERT: ${alert.type} DETECTED (${value})`);
             });
-            console.log(`  ALERT: HIGH RX DROPPED PACKETS (${rxDropped} dropped)`);
-        }
     }
 
     addAlert(alert) {
         this.alerts.push(alert);
-        if (this.alerts.length > this.alertHistorySize) {
+        while (this.alerts.length > this.alertHistorySize) {
             this.alerts.shift();
         }
     }
@@ -368,7 +432,13 @@ class NetworkMonitor {
             }
 
             const data = await fs.promises.readFile(filePath, 'utf8');
-            const value = parseInt(data.trim(), 10);
+            const trimmed = data.trim();
+            
+            if (!trimmed) {
+                return 0;
+            }
+            
+            const value = parseInt(trimmed, 10);
             
             if (isNaN(value) || value < 0) {
                 return 0;
@@ -505,17 +575,32 @@ class NetworkMonitor {
         return {
             interface: this.interface,
             startTime: new Date(this.startTime).toISOString(),
+            endTime: new Date().toISOString(),
             sampleCount: this.sampleCount,
             alerts: this.alerts.map(alert => ({
-                ...alert,
-                timestamp: alert.timestamp.toISOString()
+                type: alert.type,
+                timestamp: alert.timestamp.toISOString(),
+                rate: alert.rate,
+                count: alert.count,
+                interface: alert.interface
             })),
-            finalStats: this.prevStats,
+            finalStats: this.prevStats ? {
+                txBytes: this.prevStats.txBytes,
+                rxBytes: this.prevStats.rxBytes,
+                txPackets: this.prevStats.txPackets,
+                rxPackets: this.prevStats.rxPackets,
+                txErrors: this.prevStats.txErrors,
+                rxErrors: this.prevStats.rxErrors,
+                txDropped: this.prevStats.txDropped,
+                rxDropped: this.prevStats.rxDropped,
+                timestamp: new Date(this.prevStats.timestamp).toISOString()
+            } : null,
             settings: {
                 highTrafficThreshold: this.highTrafficThreshold,
                 errorThreshold: this.errorThreshold,
                 dropThreshold: this.dropThreshold,
-                sampleInterval: this.sampleInterval
+                sampleInterval: this.sampleInterval,
+                alertCooldown: this.alertCooldown
             }
         };
     }
@@ -580,6 +665,7 @@ async function main() {
         console.log('  --errors N       Set error threshold (default: 1000)');
         console.log('  --drops N        Set dropped packet threshold (default: 100)');
         console.log('  --interval N     Set sample interval in ms (default: 1000)');
+        console.log('  --cooldown N     Set alert cooldown in ms (default: 5000)');
         console.log('  --json           Output summary in JSON format');
         console.log('\nExamples:');
         console.log('  node network_monitor.js eth0 60');
@@ -599,6 +685,7 @@ async function main() {
     let errorThreshold = 1000;
     let dropThreshold = 100;
     let sampleInterval = 1000;
+    let alertCooldown = 5000;
     let outputJson = false;
 
     for (let i = 1; i < args.length; i++) {
@@ -613,6 +700,9 @@ async function main() {
             i++;
         } else if (args[i] === '--interval' && args[i + 1]) {
             sampleInterval = validatePositiveNumber(args[i + 1], 'Sample interval', 100);
+            i++;
+        } else if (args[i] === '--cooldown' && args[i + 1]) {
+            alertCooldown = validatePositiveNumber(args[i + 1], 'Alert cooldown', 100);
             i++;
         } else if (args[i] === '--json') {
             outputJson = true;
@@ -632,7 +722,16 @@ async function main() {
     monitor.errorThreshold = errorThreshold;
     monitor.dropThreshold = dropThreshold;
     monitor.sampleInterval = sampleInterval;
+    monitor.alertCooldown = alertCooldown;
     
+    monitor.on('error', (error) => {
+        console.error('Monitor error:', error.message);
+    });
+    
+    monitor.on('alert', (alert) => {
+        console.log(`Alert received: ${alert.type}`);
+    });
+
     const sigintHandler = () => {
         console.log('\nStopping monitor...');
         monitor.stop();
