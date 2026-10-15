@@ -1,246 +1,570 @@
-const fs = require('fs');
-const path = require('path');
-const EventEmitter = require('events');
+
+'use strict';
+
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const { performance } = require('node:perf_hooks');
+
+const VERSION = '2.1.0';
+
+const FIELDS = Object.freeze({
+    rxBytes: 'rx_bytes',
+    txBytes: 'tx_bytes',
+    rxPackets: 'rx_packets',
+    txPackets: 'tx_packets',
+    rxErrors: 'rx_errors',
+    txErrors: 'tx_errors',
+    rxDropped: 'rx_dropped',
+    txDropped: 'tx_dropped'
+});
+
+const FIELD_NAMES = Object.keys(FIELDS);
+
+function validateInterface(name) {
+    if (
+        typeof name !== 'string' ||
+        Buffer.byteLength(name) < 1 ||
+        Buffer.byteLength(name) > 15 ||
+        !/^[A-Za-z0-9_.:-]+$/.test(name) ||
+        name === '.' ||
+        name === '..'
+    ) {
+        throw new Error(`Invalid network interface: ${name}`);
+    }
+
+    return name;
+}
+
+function integer(value, name, minimum = 0) {
+    const text = String(value);
+
+    if (!/^\d+$/.test(text)) {
+        throw new Error(`${name} must be an integer`);
+    }
+
+    const result = Number(text);
+
+    if (!Number.isSafeInteger(result) || result < minimum) {
+        throw new Error(`${name} must be at least ${minimum}`);
+    }
+
+    return result;
+}
+
+function decimal(value, name, minimum = 0) {
+    const text = String(value);
+
+    if (!/^(?:\d+)(?:\.\d+)?$/.test(text)) {
+        throw new Error(`${name} must be a nonnegative number`);
+    }
+
+    const result = Number(text);
+
+    if (!Number.isFinite(result) || result < minimum) {
+        throw new Error(`${name} must be at least ${minimum}`);
+    }
+
+    return result;
+}
+
+function zeros() {
+    return Object.fromEntries(FIELD_NAMES.map(key => [key, 0n]));
+}
+
+function serialize(value) {
+    return JSON.stringify(value, (_, item) => {
+        return typeof item === 'bigint' ? item.toString() : item;
+    });
+}
+
+function formatBytes(value) {
+    let number = Number(value);
+
+    if (!Number.isFinite(number) || number < 0) {
+        return 'N/A';
+    }
+
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
+    let index = 0;
+
+    while (number >= 1024 && index < units.length - 1) {
+        number /= 1024;
+        index++;
+    }
+
+    return `${number.toFixed(index === 0 ? 0 : 2)} ${units[index]}`;
+}
+
+function formatRate(value) {
+    return `${formatBytes(value)}/s`;
+}
+
+function calculateDelta(previous, current) {
+    const delta = zeros();
+    const resets = [];
+
+    for (const key of FIELD_NAMES) {
+        if (current[key] < previous[key]) {
+            resets.push(key);
+        } else {
+            delta[key] = current[key] - previous[key];
+        }
+    }
+
+    return { delta, resets };
+}
+
+function mean(values) {
+    if (!values.length) {
+        return 0;
+    }
+
+    return values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function finiteNumber(value) {
+    return Number.isFinite(value) ? value : null;
+}
+
+class InterfaceMonitor {
+    constructor(name, options) {
+        this.name = validateInterface(name);
+        this.options = options;
+        this.base = path.join('/sys/class/net', this.name);
+        this.previous = null;
+        this.previousTime = null;
+        this.lastCounters = null;
+        this.totals = zeros();
+        this.sampleCount = 0;
+        this.resetCount = 0;
+        this.errorCount = 0;
+        this.consecutiveFailures = 0;
+        this.history = [];
+        this.lastRates = null;
+        this.peaks = {
+            rxBytesPerSecond: 0,
+            txBytesPerSecond: 0,
+            rxPacketsPerSecond: 0,
+            txPacketsPerSecond: 0
+        };
+        this.measuredSeconds = 0;
+        this.lastAlertTime = new Map();
+        this.alertCount = 0;
+    }
+
+    async exists() {
+        try {
+            const result = await fs.stat(this.base);
+            return result.isDirectory();
+        } catch {
+            return false;
+        }
+    }
+
+    async readCounters() {
+        const values = await Promise.all(
+            FIELD_NAMES.map(async key => {
+                const filename = path.join(
+                    this.base,
+                    'statistics',
+                    FIELDS[key]
+                );
+
+                const content = (
+                    await fs.readFile(filename, 'utf8')
+                ).trim();
+
+                if (!/^\d+$/.test(content)) {
+                    throw new Error(
+                        `Invalid ${FIELDS[key]} counter on ${this.name}`
+                    );
+                }
+
+                return BigInt(content);
+            })
+        );
+
+        const result = {};
+
+        FIELD_NAMES.forEach((key, index) => {
+            result[key] = values[index];
+        });
+
+        return result;
+    }
+
+    async readMetadata() {
+        const result = { interface: this.name };
+
+        for (const field of ['operstate', 'mtu', 'speed', 'address']) {
+            try {
+                result[field] = (
+                    await fs.readFile(path.join(this.base, field), 'utf8')
+                ).trim();
+            } catch {
+                result[field] = null;
+            }
+        }
+
+        return result;
+    }
+
+    async establishBaseline() {
+        const counters = await this.readCounters();
+
+        this.previous = counters;
+        this.previousTime = performance.now();
+        this.lastCounters = counters;
+        this.consecutiveFailures = 0;
+    }
+
+    rollingRates() {
+        const keys = Object.keys(this.peaks);
+        const result = {};
+
+        for (const key of keys) {
+            result[key] = mean(this.history.map(item => item[key]));
+        }
+
+        return result;
+    }
+
+    createAlert(type, value, threshold) {
+        const now = Date.now();
+        const last = this.lastAlertTime.get(type) ?? -Infinity;
+
+        if (now - last < this.options.cooldown) {
+            return null;
+        }
+
+        this.lastAlertTime.set(type, now);
+        this.alertCount++;
+
+        return {
+            timestamp: new Date(now).toISOString(),
+            interface: this.name,
+            type,
+            value: typeof value === 'bigint' ? value.toString() : value,
+            threshold: typeof threshold === 'bigint'
+                ? threshold.toString()
+                : threshold
+        };
+    }
+
+    checkAlerts(rates, delta, elapsed) {
+        const alerts = [];
+
+        const checks = [
+            [
+                'HIGH_RX_TRAFFIC',
+                rates.rxBytesPerSecond,
+                this.options.thresholdBytes
+            ],
+            [
+                'HIGH_TX_TRAFFIC',
+                rates.txBytesPerSecond,
+                this.options.thresholdBytes
+            ],
+            [
+                'HIGH_RX_ERRORS',
+                Number(delta.rxErrors) / elapsed,
+                this.options.errorThreshold
+            ],
+            [
+                'HIGH_TX_ERRORS',
+                Number(delta.txErrors) / elapsed,
+                this.options.errorThreshold
+            ],
+            [
+                'HIGH_RX_DROPPED',
+                Number(delta.rxDropped) / elapsed,
+                this.options.dropThreshold
+            ],
+            [
+                'HIGH_TX_DROPPED',
+                Number(delta.txDropped) / elapsed,
+                this.options.dropThreshold
+            ]
+        ];
+
+        for (const [type, value, threshold] of checks) {
+            if (value > threshold) {
+                const alert = this.createAlert(type, value, threshold);
+
+                if (alert) {
+                    alerts.push(alert);
+                }
+            }
+        }
+
+        return alerts;
+    }
+
+    async sample() {
+        const counters = await this.readCounters();
+        const now = performance.now();
+
+        if (!this.previous || this.previousTime === null) {
+            this.previous = counters;
+            this.previousTime = now;
+            this.lastCounters = counters;
+            return null;
+        }
+
+        const elapsed = (now - this.previousTime) / 1000;
+        const result = calculateDelta(this.previous, counters);
+
+        this.previous = counters;
+        this.previousTime = now;
+        this.lastCounters = counters;
+        this.consecutiveFailures = 0;
+
+        if (result.resets.length > 0) {
+            this.resetCount++;
+
+            return {
+                type: 'reset',
+                timestamp: new Date().toISOString(),
+                interface: this.name,
+                counters: result.resets
+            };
+        }
+
+        if (elapsed <= 0) {
+            return null;
+        }
+
+        for (const key of FIELD_NAMES) {
+            this.totals[key] += result.delta[key];
+        }
+
+        this.measuredSeconds += elapsed;
+        this.sampleCount++;
+
+        const rates = {
+            rxBytesPerSecond: Number(result.delta.rxBytes) / elapsed,
+            txBytesPerSecond: Number(result.delta.txBytes) / elapsed,
+            rxPacketsPerSecond: Number(result.delta.rxPackets) / elapsed,
+            txPacketsPerSecond: Number(result.delta.txPackets) / elapsed
+        };
+
+        for (const key of Object.keys(this.peaks)) {
+            this.peaks[key] = Math.max(this.peaks[key], rates[key]);
+        }
+
+        this.lastRates = rates;
+        this.history.push(rates);
+
+        if (this.history.length > this.options.historySize) {
+            this.history.shift();
+        }
+
+        return {
+            type: 'sample',
+            timestamp: new Date().toISOString(),
+            interface: this.name,
+            elapsedSeconds: elapsed,
+            delta: result.delta,
+            rates,
+            rollingRates: this.rollingRates(),
+            alerts: this.checkAlerts(rates, result.delta, elapsed)
+        };
+    }
+
+    summary() {
+        const totals = this.totals;
+        const totalBytes = totals.rxBytes + totals.txBytes;
+        const totalPackets = totals.rxPackets + totals.txPackets;
+        const totalErrors = totals.rxErrors + totals.txErrors;
+
+        return {
+            interface: this.name,
+            samples: this.sampleCount,
+            resets: this.resetCount,
+            errors: this.errorCount,
+            alerts: this.alertCount,
+            measuredSeconds: this.measuredSeconds,
+            totals,
+            lastCounters: this.lastCounters,
+            averageRates: {
+                rxBytesPerSecond: this.measuredSeconds > 0
+                    ? finiteNumber(Number(totals.rxBytes) / this.measuredSeconds)
+                    : 0,
+                txBytesPerSecond: this.measuredSeconds > 0
+                    ? finiteNumber(Number(totals.txBytes) / this.measuredSeconds)
+                    : 0
+            },
+            lastRates: this.lastRates,
+            rollingRates: this.rollingRates(),
+            peakRates: this.peaks,
+            averagePacketSize: totalPackets > 0n
+                ? finiteNumber(Number(totalBytes) / Number(totalPackets))
+                : null,
+            errorRatePercent: totalPackets > 0n
+                ? finiteNumber(Number(totalErrors) / Number(totalPackets) * 100)
+                : null
+        };
+    }
+}
 
 class NetworkMonitor extends EventEmitter {
-    constructor(interfaceName, options = {}) {
+    constructor(interfaceNames, options = {}) {
         super();
-        this.interface = this.sanitizeInterfaceName(interfaceName);
-        this.duration = Math.max(0, Number(options.duration || 0));
-        this.highTrafficThreshold = BigInt(options.highTrafficThreshold ?? 50 * 1024 * 1024);
-        this.errorThreshold = BigInt(options.errorThreshold ?? 1000);
-        this.dropThreshold = BigInt(options.dropThreshold ?? 100);
-        this.sampleInterval = Math.max(100, Number(options.sampleInterval || 1000));
-        this.alertCooldown = Math.max(100, Number(options.alertCooldown || 5000));
-        this.alertHistorySize = Math.max(1, Number(options.alertHistorySize || 100));
-        this.maxFileSize = Math.max(1024, Number(options.maxFileSize || 16384));
+
+        this.options = {
+            duration: options.duration ?? 0,
+            interval: options.interval ?? 1000,
+            thresholdBytes: options.thresholdBytes ?? 50 * 1024 * 1024,
+            errorThreshold: options.errorThreshold ?? 1000,
+            dropThreshold: options.dropThreshold ?? 100,
+            cooldown: options.cooldown ?? 5000,
+            historySize: options.historySize ?? 60,
+            maxFailures: options.maxFailures ?? 5
+        };
+
+        if (!Array.isArray(interfaceNames) || !interfaceNames.length) {
+            throw new Error('At least one interface is required');
+        }
+
+        this.interfaces = [...new Set(interfaceNames)].map(
+            name => new InterfaceMonitor(name, this.options)
+        );
+
         this.state = 'stopped';
-        this.startTime = 0;
-        this.endTime = 0;
-        this.prevStats = null;
-        this.initialStats = null;
-        this.lastStats = null;
-        this.alerts = [];
-        this.sampleCount = 0;
-        this.monitorInterval = null;
-        this.durationTimeout = null;
-        this.currentSamplePromise = null;
-        this.lastAlertTimestamps = new Map();
+        this.startedAt = null;
+        this.stoppedAt = null;
+        this.activeSince = null;
+        this.activeMilliseconds = 0;
+        this.timer = null;
+        this.durationTimer = null;
+        this.pending = null;
+        this.stopPromise = null;
+        this.alertCount = 0;
+        this.errorCount = 0;
     }
 
-    sanitizeInterfaceName(name) {
-        if (!name || typeof name !== 'string') {
-            throw new Error('Interface name must be a non-empty string');
+    async start() {
+        if (this.state !== 'stopped' || this.startedAt !== null) {
+            throw new Error('Monitor has already been started');
         }
 
-        const cleanName = name.trim();
-        if (cleanName.length === 0 || cleanName.length > 64) {
-            throw new Error('Interface name must be between 1 and 64 characters');
+        for (const iface of this.interfaces) {
+            if (!await iface.exists()) {
+                throw new Error(`Interface does not exist: ${iface.name}`);
+            }
+
+            await iface.establishBaseline();
         }
 
-        if (cleanName.includes('/') || cleanName.includes('..')) {
-            throw new Error('Interface name cannot contain path characters');
-        }
+        this.startedAt = new Date().toISOString();
+        this.activeSince = performance.now();
+        this.state = 'running';
 
-        if (!/^[a-z0-9]+[a-z0-9\-_:.]*$/i.test(cleanName)) {
-            throw new Error('Interface name must start with alphanumeric and contain only letters, numbers, hyphens, underscores, colons, or dots');
-        }
+        this.emit('started', {
+            interfaces: this.interfaces.map(item => item.name),
+            options: this.options
+        });
 
-        return cleanName;
-    }
+        this.schedule();
 
-    getInterfaceBasePath() {
-        return path.posix.join('/sys/class/net', this.interface);
-    }
-
-    getStatisticsBasePath() {
-        return path.posix.join(this.getInterfaceBasePath(), 'statistics');
-    }
-
-    validateInterfacePath(filePath) {
-        try {
-            const normalizedPath = path.posix.normalize(filePath).replace(/\/+/g, '/');
-            const expectedPath = this.getInterfaceBasePath();
-
-            if (normalizedPath !== expectedPath) {
-                return { valid: false, reason: 'Invalid interface path' };
-            }
-
-            const rel = path.posix.relative('/sys/class/net', normalizedPath);
-            if (!rel || rel.startsWith('..') || path.posix.isAbsolute(rel)) {
-                return { valid: false, reason: 'Path escapes /sys/class/net' };
-            }
-
-            const parts = rel.split('/').filter(Boolean);
-            if (parts.length !== 1) {
-                return { valid: false, reason: 'Interface path depth invalid' };
-            }
-
-            try {
-                this.sanitizeInterfaceName(parts[0]);
-            } catch (error) {
-                return { valid: false, reason: error.message };
-            }
-
-            return { valid: true };
-        } catch (error) {
-            return { valid: false, reason: `Validation error: ${error.message}` };
+        if (this.options.duration > 0) {
+            this.durationTimer = setTimeout(() => {
+                this.stop().catch(error => this.emit('monitorError', error));
+            }, this.options.duration * 1000);
         }
     }
 
-    validateStatisticsPath(filePath) {
-        try {
-            const normalizedPath = path.posix.normalize(filePath).replace(/\/+/g, '/');
-            const expectedBase = this.getStatisticsBasePath();
-
-            if (!normalizedPath.startsWith(expectedBase + '/')) {
-                return { valid: false, reason: 'Path must be within interface statistics directory' };
-            }
-
-            const rel = path.posix.relative(expectedBase, normalizedPath);
-            if (!rel || rel.startsWith('..') || path.posix.isAbsolute(rel)) {
-                return { valid: false, reason: 'Path escapes statistics directory' };
-            }
-
-            const parts = rel.split('/').filter(Boolean);
-            if (parts.length !== 1) {
-                return { valid: false, reason: 'Statistics path depth invalid' };
-            }
-
-            const allowedFiles = new Set([
-                'tx_bytes',
-                'rx_bytes',
-                'tx_packets',
-                'rx_packets',
-                'tx_errors',
-                'rx_errors',
-                'tx_dropped',
-                'rx_dropped'
-            ]);
-
-            if (!allowedFiles.has(parts[0])) {
-                return { valid: false, reason: `File ${parts[0]} not allowed in statistics directory` };
-            }
-
-            return { valid: true };
-        } catch (error) {
-            return { valid: false, reason: `Validation error: ${error.message}` };
-        }
-    }
-
-    resetRuntimeState() {
-        this.startTime = Date.now();
-        this.endTime = 0;
-        this.prevStats = null;
-        this.initialStats = null;
-        this.lastStats = null;
-        this.alerts = [];
-        this.sampleCount = 0;
-        this.currentSamplePromise = null;
-        this.lastAlertTimestamps.clear();
-    }
-
-    startTicker() {
-        if (this.monitorInterval) {
-            clearInterval(this.monitorInterval);
+    schedule() {
+        if (this.state !== 'running') {
+            return;
         }
 
-        this.monitorInterval = setInterval(() => {
+        this.timer = setTimeout(() => {
+            this.timer = null;
+
             if (this.state !== 'running') {
                 return;
             }
 
-            if (this.currentSamplePromise) {
-                return;
-            }
+            const pending = this.sampleAll();
+            this.pending = pending;
 
-            this.currentSamplePromise = this.sample()
-                .catch(error => {
-                    this.emit('error', error);
-                })
+            pending
+                .catch(error => this.emit('monitorError', error))
                 .finally(() => {
-                    this.currentSamplePromise = null;
+                    if (this.pending === pending) {
+                        this.pending = null;
+                    }
+
+                    if (this.state === 'running') {
+                        this.schedule();
+                    }
                 });
-        }, this.sampleInterval);
+        }, this.options.interval);
     }
 
-    stopTicker() {
-        if (this.monitorInterval) {
-            clearInterval(this.monitorInterval);
-            this.monitorInterval = null;
-        }
-    }
+    async sampleAll() {
+        const results = await Promise.allSettled(
+            this.interfaces.map(iface => iface.sample())
+        );
 
-    startDurationTimer() {
-        if (this.durationTimeout) {
-            clearTimeout(this.durationTimeout);
-        }
+        for (let i = 0; i < results.length; i++) {
+            const iface = this.interfaces[i];
+            const result = results[i];
 
-        if (this.duration > 0) {
-            this.durationTimeout = setTimeout(() => {
-                this.stop().catch(error => {
-                    this.emit('error', error);
+            if (result.status === 'rejected') {
+                iface.errorCount++;
+                iface.consecutiveFailures++;
+                this.errorCount++;
+
+                this.emit('monitorError', {
+                    interface: iface.name,
+                    message: result.reason?.message ?? String(result.reason),
+                    failures: iface.consecutiveFailures
                 });
-            }, this.duration * 1000);
-        }
-    }
 
-    stopDurationTimer() {
-        if (this.durationTimeout) {
-            clearTimeout(this.durationTimeout);
-            this.durationTimeout = null;
-        }
-    }
+                if (iface.consecutiveFailures >= this.options.maxFailures) {
+                    this.emit('monitorError', {
+                        interface: iface.name,
+                        message: 'Maximum consecutive failures reached'
+                    });
 
-    async start() {
-        if (this.state === 'running') {
-            throw new Error('Monitor is already running');
-        }
+                    queueMicrotask(() => {
+                        this.stop().catch(error => {
+                            this.emit('monitorError', error);
+                        });
+                    });
+                } else {
+                    try {
+                        await iface.establishBaseline();
+                    } catch {
+                        iface.previous = null;
+                        iface.previousTime = null;
+                    }
+                }
 
-        if (this.state === 'paused') {
-            throw new Error('Monitor is paused; use resume()');
-        }
+                continue;
+            }
 
-        const exists = await this.interfaceExists();
-        if (!exists) {
-            throw new Error(`Interface ${this.interface} not found or not accessible`);
-        }
+            const data = result.value;
 
-        this.resetRuntimeState();
+            if (!data) {
+                continue;
+            }
 
-        const stats = await this.getNetworkStats();
-        this.prevStats = stats;
-        this.initialStats = this.cloneStats(stats);
-        this.lastStats = this.cloneStats(stats);
-        this.state = 'running';
-        this.startTicker();
-        this.startDurationTimer();
-        this.emit('started', {
-            interface: this.interface,
-            duration: this.duration,
-            sampleInterval: this.sampleInterval
-        });
-    }
+            if (data.type === 'reset') {
+                this.emit('reset', data);
+                continue;
+            }
 
-    async stop() {
-        if (this.state === 'stopped') {
-            return;
-        }
+            this.emit('sample', data);
 
-        this.state = 'stopped';
-        this.stopTicker();
-        this.stopDurationTimer();
-
-        const pending = this.currentSamplePromise;
-        if (pending) {
-            try {
-                await pending;
-            } catch (_) {
+            for (const alert of data.alerts) {
+                this.alertCount++;
+                this.emit('alert', alert);
             }
         }
-
-        this.endTime = Date.now();
-        this.emit('stopped', this.getSummary());
     }
 
     pause() {
@@ -248,738 +572,447 @@ class NetworkMonitor extends EventEmitter {
             return;
         }
 
+        this.activeMilliseconds += performance.now() - this.activeSince;
+        this.activeSince = null;
         this.state = 'paused';
-        this.stopTicker();
-        this.stopDurationTimer();
-        this.emit('paused', {
-            interface: this.interface,
-            timestamp: new Date()
-        });
+
+        if (this.timer !== null) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+
+        this.emit('paused');
     }
 
-    resume() {
+    async resume() {
         if (this.state !== 'paused') {
             return;
         }
 
-        if (!this.prevStats) {
-            throw new Error('Cannot resume without previous statistics');
+        if (this.pending) {
+            await this.pending;
         }
 
+        for (const iface of this.interfaces) {
+            await iface.establishBaseline();
+        }
+
+        this.activeSince = performance.now();
         this.state = 'running';
-        this.startTicker();
-        this.startDurationTimer();
-        this.emit('resumed', {
-            interface: this.interface,
-            timestamp: new Date()
-        });
+        this.emit('resumed');
+        this.schedule();
     }
 
-    cloneStats(stats) {
-        if (!stats) {
-            return null;
+    elapsedSeconds() {
+        let milliseconds = this.activeMilliseconds;
+
+        if (this.activeSince !== null) {
+            milliseconds += performance.now() - this.activeSince;
         }
 
+        return milliseconds / 1000;
+    }
+
+    async stop() {
+        if (this.stopPromise) {
+            return this.stopPromise;
+        }
+
+        if (this.state === 'stopped') {
+            return this.summary();
+        }
+
+        this.stopPromise = this.finishStop();
+        return this.stopPromise;
+    }
+
+    async finishStop() {
+        if (this.activeSince !== null) {
+            this.activeMilliseconds += performance.now() - this.activeSince;
+            this.activeSince = null;
+        }
+
+        this.state = 'stopped';
+
+        if (this.timer !== null) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+
+        if (this.durationTimer !== null) {
+            clearTimeout(this.durationTimer);
+            this.durationTimer = null;
+        }
+
+        if (this.pending) {
+            await this.pending;
+        }
+
+        this.stoppedAt = new Date().toISOString();
+
+        const result = this.summary();
+        this.emit('stopped', result);
+
+        return result;
+    }
+
+    summary() {
         return {
-            interface: stats.interface,
-            timestamp: stats.timestamp,
-            txBytes: BigInt(stats.txBytes),
-            rxBytes: BigInt(stats.rxBytes),
-            txPackets: BigInt(stats.txPackets),
-            rxPackets: BigInt(stats.rxPackets),
-            txErrors: BigInt(stats.txErrors),
-            rxErrors: BigInt(stats.rxErrors),
-            txDropped: BigInt(stats.txDropped),
-            rxDropped: BigInt(stats.rxDropped)
-        };
-    }
-
-    async sample() {
-        if (this.state !== 'running') {
-            return;
-        }
-
-        const currentStats = await this.getNetworkStats();
-
-        if (!this.prevStats) {
-            this.prevStats = this.cloneStats(currentStats);
-            this.lastStats = this.cloneStats(currentStats);
-            return;
-        }
-
-        const txRate = this.calculateCounterDelta(this.prevStats.txBytes, currentStats.txBytes);
-        const rxRate = this.calculateCounterDelta(this.prevStats.rxBytes, currentStats.rxBytes);
-        const txPacketRate = this.calculateCounterDelta(this.prevStats.txPackets, currentStats.txPackets);
-        const rxPacketRate = this.calculateCounterDelta(this.prevStats.rxPackets, currentStats.rxPackets);
-        const txErrorsDelta = this.calculateCounterDelta(this.prevStats.txErrors, currentStats.txErrors);
-        const rxErrorsDelta = this.calculateCounterDelta(this.prevStats.rxErrors, currentStats.rxErrors);
-        const txDroppedDelta = this.calculateCounterDelta(this.prevStats.txDropped, currentStats.txDropped);
-        const rxDroppedDelta = this.calculateCounterDelta(this.prevStats.rxDropped, currentStats.rxDropped);
-
-        const sampleData = {
-            timestamp: new Date(),
-            interface: this.interface,
-            txRate,
-            rxRate,
-            txPacketRate,
-            rxPacketRate,
-            txErrorsDelta,
-            rxErrorsDelta,
-            txDroppedDelta,
-            rxDroppedDelta,
-            currentStats: this.cloneStats(currentStats)
-        };
-
-        const alerts = this.checkAlerts(
-            txRate,
-            rxRate,
-            txErrorsDelta,
-            rxErrorsDelta,
-            txDroppedDelta,
-            rxDroppedDelta
-        );
-
-        sampleData.alerts = alerts;
-
-        this.prevStats = this.cloneStats(currentStats);
-        this.lastStats = this.cloneStats(currentStats);
-        this.sampleCount++;
-        this.emit('sample', sampleData);
-    }
-
-    calculateCounterDelta(prev, curr) {
-        const prevBig = BigInt(prev);
-        const currBig = BigInt(curr);
-
-        if (currBig >= prevBig) {
-            return currBig - prevBig;
-        }
-
-        const maxUint64 = (1n << 64n) - 1n;
-        return (maxUint64 - prevBig) + currBig + 1n;
-    }
-
-    checkAlerts(txRate, rxRate, txErrors, rxErrors, txDropped, rxDropped) {
-        const now = Date.now();
-        const emitted = [];
-
-        const checkAndAddAlert = (type, condition, details) => {
-            if (!condition) {
-                return;
-            }
-
-            const lastAlert = this.lastAlertTimestamps.get(type) || 0;
-            if (now - lastAlert < this.alertCooldown) {
-                return;
-            }
-
-            const alert = {
-                timestamp: new Date(now),
-                type,
-                interface: this.interface,
-                ...details
-            };
-
-            this.addAlert(alert);
-            this.lastAlertTimestamps.set(type, now);
-            this.emit('alert', alert);
-            emitted.push(alert);
-        };
-
-        checkAndAddAlert('HIGH_TX_TRAFFIC', txRate > this.highTrafficThreshold, { rate: txRate });
-        checkAndAddAlert('HIGH_RX_TRAFFIC', rxRate > this.highTrafficThreshold, { rate: rxRate });
-        checkAndAddAlert('HIGH_TX_ERRORS', txErrors > this.errorThreshold, { count: txErrors });
-        checkAndAddAlert('HIGH_RX_ERRORS', rxErrors > this.errorThreshold, { count: rxErrors });
-        checkAndAddAlert('HIGH_TX_DROPPED', txDropped > this.dropThreshold, { count: txDropped });
-        checkAndAddAlert('HIGH_RX_DROPPED', rxDropped > this.dropThreshold, { count: rxDropped });
-
-        return emitted;
-    }
-
-    addAlert(alert) {
-        this.alerts.push(alert);
-        while (this.alerts.length > this.alertHistorySize) {
-            this.alerts.shift();
-        }
-    }
-
-    async getNetworkStats() {
-        const basePath = this.getStatisticsBasePath();
-        const statsFiles = {
-            txBytes: 'tx_bytes',
-            rxBytes: 'rx_bytes',
-            txPackets: 'tx_packets',
-            rxPackets: 'rx_packets',
-            txErrors: 'tx_errors',
-            rxErrors: 'rx_errors',
-            txDropped: 'tx_dropped',
-            rxDropped: 'rx_dropped'
-        };
-
-        const stats = {
-            interface: this.interface,
-            timestamp: Date.now()
-        };
-
-        const fileEntries = Object.entries(statsFiles).map(([key, fileName]) => ({
-            key,
-            filePath: path.posix.join(basePath, fileName)
-        }));
-
-        const values = await Promise.all(
-            fileEntries.map(entry => this.readSysFile(entry.filePath))
-        );
-
-        values.forEach((value, index) => {
-            stats[fileEntries[index].key] = value;
-        });
-
-        return stats;
-    }
-
-    async readSysFile(filePath) {
-        const validation = this.validateStatisticsPath(filePath);
-        if (!validation.valid) {
-            throw new Error(validation.reason);
-        }
-
-        try {
-            const stats = await fs.promises.stat(filePath);
-            if (stats.size > this.maxFileSize) {
-                throw new Error(`File too large: ${stats.size} bytes`);
-            }
-
-            const data = await fs.promises.readFile(filePath, 'utf8');
-            const trimmed = data.trim();
-
-            if (!trimmed) {
-                return 0n;
-            }
-
-            if (!/^\d+$/.test(trimmed)) {
-                throw new Error(`Invalid numeric content in ${filePath}`);
-            }
-
-            return BigInt(trimmed);
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                throw new Error(`Network statistics not available for interface ${this.interface}`);
-            }
-            if (error.code === 'EACCES') {
-                throw new Error(`Permission denied reading statistics for ${this.interface}`);
-            }
-            throw error;
-        }
-    }
-
-    async interfaceExists() {
-        try {
-            const interfacePath = this.getInterfaceBasePath();
-            const validation = this.validateInterfacePath(interfacePath);
-
-            if (!validation.valid) {
-                return false;
-            }
-
-            await fs.promises.access(interfacePath, fs.constants.R_OK);
-            const stats = await fs.promises.stat(interfacePath);
-            return stats.isDirectory();
-        } catch (_) {
-            return false;
-        }
-    }
-
-    getElapsedSeconds() {
-        const end = this.endTime || Date.now();
-        return Math.max(0, (end - this.startTime) / 1000);
-    }
-
-    getSessionTotals() {
-        if (!this.initialStats || !this.lastStats) {
-            return null;
-        }
-
-        return {
-            txBytes: this.calculateCounterDelta(this.initialStats.txBytes, this.lastStats.txBytes),
-            rxBytes: this.calculateCounterDelta(this.initialStats.rxBytes, this.lastStats.rxBytes),
-            txPackets: this.calculateCounterDelta(this.initialStats.txPackets, this.lastStats.txPackets),
-            rxPackets: this.calculateCounterDelta(this.initialStats.rxPackets, this.lastStats.rxPackets),
-            txErrors: this.calculateCounterDelta(this.initialStats.txErrors, this.lastStats.txErrors),
-            rxErrors: this.calculateCounterDelta(this.initialStats.rxErrors, this.lastStats.rxErrors),
-            txDropped: this.calculateCounterDelta(this.initialStats.txDropped, this.lastStats.txDropped),
-            rxDropped: this.calculateCounterDelta(this.initialStats.rxDropped, this.lastStats.rxDropped)
-        };
-    }
-
-    getSummary() {
-        const elapsed = this.getElapsedSeconds();
-        const sessionTotals = this.getSessionTotals();
-
-        const interfaceTotals = this.lastStats ? {
-            txBytes: this.lastStats.txBytes,
-            rxBytes: this.lastStats.rxBytes,
-            txPackets: this.lastStats.txPackets,
-            rxPackets: this.lastStats.rxPackets,
-            txErrors: this.lastStats.txErrors,
-            rxErrors: this.lastStats.rxErrors,
-            txDropped: this.lastStats.txDropped,
-            rxDropped: this.lastStats.rxDropped
-        } : null;
-
-        const combinedSession = sessionTotals ? {
-            totalBytes: sessionTotals.txBytes + sessionTotals.rxBytes,
-            totalPackets: sessionTotals.txPackets + sessionTotals.rxPackets,
-            totalErrors: sessionTotals.txErrors + sessionTotals.rxErrors,
-            totalDropped: sessionTotals.txDropped + sessionTotals.rxDropped
-        } : null;
-
-        const averageRates = sessionTotals && elapsed > 0 ? {
-            txBytesPerSecond: Number(sessionTotals.txBytes) / elapsed,
-            rxBytesPerSecond: Number(sessionTotals.rxBytes) / elapsed
-        } : null;
-
-        const avgPacketSize = combinedSession && combinedSession.totalPackets > 0n
-            ? Number(combinedSession.totalBytes) / Number(combinedSession.totalPackets)
-            : null;
-
-        const errorRate = combinedSession && combinedSession.totalPackets > 0n
-            ? (Number(combinedSession.totalErrors) / Number(combinedSession.totalPackets)) * 100
-            : null;
-
-        return {
-            interface: this.interface,
+            version: VERSION,
             state: this.state,
-            startTime: this.startTime ? new Date(this.startTime).toISOString() : null,
-            endTime: this.endTime ? new Date(this.endTime).toISOString() : new Date().toISOString(),
-            durationSeconds: elapsed,
-            sampleCount: this.sampleCount,
-            alerts: this.alerts.map(alert => ({
-                type: alert.type,
-                timestamp: alert.timestamp.toISOString(),
-                rate: alert.rate !== undefined ? alert.rate.toString() : undefined,
-                count: alert.count !== undefined ? alert.count.toString() : undefined,
-                interface: alert.interface
-            })),
-            sessionTotals: sessionTotals ? {
-                txBytes: sessionTotals.txBytes.toString(),
-                rxBytes: sessionTotals.rxBytes.toString(),
-                txPackets: sessionTotals.txPackets.toString(),
-                rxPackets: sessionTotals.rxPackets.toString(),
-                txErrors: sessionTotals.txErrors.toString(),
-                rxErrors: sessionTotals.rxErrors.toString(),
-                txDropped: sessionTotals.txDropped.toString(),
-                rxDropped: sessionTotals.rxDropped.toString()
-            } : null,
-            interfaceTotals: interfaceTotals ? {
-                txBytes: interfaceTotals.txBytes.toString(),
-                rxBytes: interfaceTotals.rxBytes.toString(),
-                txPackets: interfaceTotals.txPackets.toString(),
-                rxPackets: interfaceTotals.rxPackets.toString(),
-                txErrors: interfaceTotals.txErrors.toString(),
-                rxErrors: interfaceTotals.rxErrors.toString(),
-                txDropped: interfaceTotals.txDropped.toString(),
-                rxDropped: interfaceTotals.rxDropped.toString()
-            } : null,
-            combinedSession: combinedSession ? {
-                totalBytes: combinedSession.totalBytes.toString(),
-                totalPackets: combinedSession.totalPackets.toString(),
-                totalErrors: combinedSession.totalErrors.toString(),
-                totalDropped: combinedSession.totalDropped.toString()
-            } : null,
-            averageRates: averageRates ? {
-                txBytesPerSecond: averageRates.txBytesPerSecond,
-                rxBytesPerSecond: averageRates.rxBytesPerSecond
-            } : null,
-            averagePacketSize: avgPacketSize,
-            errorRatePercent: errorRate,
-            settings: {
-                highTrafficThreshold: this.highTrafficThreshold.toString(),
-                errorThreshold: this.errorThreshold.toString(),
-                dropThreshold: this.dropThreshold.toString(),
-                sampleInterval: this.sampleInterval,
-                alertCooldown: this.alertCooldown
-            }
+            startedAt: this.startedAt,
+            stoppedAt: this.stoppedAt,
+            activeSeconds: this.elapsedSeconds(),
+            alerts: this.alertCount,
+            errors: this.errorCount,
+            interfaces: this.interfaces.map(iface => iface.summary())
         };
-    }
-
-    exportToJson() {
-        return this.getSummary();
-    }
-
-    formatBytes(value) {
-        let bytes;
-
-        if (typeof value === 'bigint') {
-            bytes = Number(value);
-        } else if (typeof value === 'number') {
-            bytes = value;
-        } else {
-            bytes = Number(value || 0);
-        }
-
-        if (!Number.isFinite(bytes) || bytes < 0) {
-            return '0 B';
-        }
-
-        const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-        let unitIndex = 0;
-
-        while (bytes >= 1024 && unitIndex < units.length - 1) {
-            bytes /= 1024;
-            unitIndex++;
-        }
-
-        return bytes.toFixed(unitIndex === 0 ? 0 : 2) + ' ' + units[unitIndex];
     }
 }
 
 class ConsoleRenderer {
-    constructor(output = console) {
-        this.output = output;
-    }
-
-    renderStarted(info, monitor) {
-        this.output.log(`Checking interface ${monitor.interface}...`);
-        this.output.log(`Network Traffic Monitor - ${monitor.interface}`);
-        this.output.log(`Duration: ${info.duration > 0 ? info.duration + ' seconds' : 'unlimited'}`);
-        this.output.log(`Sample interval: ${info.sampleInterval}ms`);
-        this.output.log(`High traffic threshold: ${monitor.formatBytes(monitor.highTrafficThreshold)}/s`);
-        this.output.log('Press Ctrl+C to stop');
-        this.output.log('');
-    }
-
-    renderPaused(interfaceName) {
-        this.output.log(`Monitoring paused for ${interfaceName}`);
-    }
-
-    renderResumed(interfaceName) {
-        this.output.log(`Monitoring resumed for ${interfaceName}`);
-    }
-
-    renderError(error) {
-        this.output.error(`Monitor error: ${error.message}`);
-    }
-
-    renderSample(sample, monitor) {
-        const timestamp = sample.timestamp.toISOString().replace('T', ' ').substring(0, 19);
-
-        this.output.log(`[${timestamp}] ${sample.interface}`);
-        this.output.log(
-            `  TX: ${monitor.formatBytes(sample.txRate).padStart(8)}/s (${sample.txPacketRate.toString().padStart(5)} pkt/s) | Total: ${monitor.formatBytes(sample.currentStats.txBytes)}`
+    started(data) {
+        console.log(`RXTX Monitor v${VERSION}`);
+        console.log(`Interfaces: ${data.interfaces.join(', ')}`);
+        console.log(`Sampling interval: ${data.options.interval} ms`);
+        console.log(
+            `Traffic threshold: ${formatRate(data.options.thresholdBytes)}`
         );
-        this.output.log(
-            `  RX: ${monitor.formatBytes(sample.rxRate).padStart(8)}/s (${sample.rxPacketRate.toString().padStart(5)} pkt/s) | Total: ${monitor.formatBytes(sample.currentStats.rxBytes)}`
+        console.log('Press Ctrl+C to stop');
+        console.log('');
+    }
+
+    sample(data) {
+        const time = data.timestamp.replace('T', ' ').slice(0, 19);
+
+        console.log(`[${time}] ${data.interface}`);
+        console.log(
+            `  RX  ${formatRate(data.rates.rxBytesPerSecond).padStart(15)}  ` +
+            `${data.rates.rxPacketsPerSecond.toFixed(1)} packets/s`
+        );
+        console.log(
+            `  TX  ${formatRate(data.rates.txBytesPerSecond).padStart(15)}  ` +
+            `${data.rates.txPacketsPerSecond.toFixed(1)} packets/s`
+        );
+        console.log(
+            `  Rolling RX: ${formatRate(data.rollingRates.rxBytesPerSecond)}`
+        );
+        console.log(
+            `  Rolling TX: ${formatRate(data.rollingRates.txBytesPerSecond)}`
         );
 
-        if (sample.txErrorsDelta > 0n || sample.rxErrorsDelta > 0n) {
-            this.output.log(`  ERRORS: TX=${sample.txErrorsDelta.toString()}, RX=${sample.rxErrorsDelta.toString()}`);
+        if (data.delta.rxErrors > 0n || data.delta.txErrors > 0n) {
+            console.log(
+                `  Errors: RX=${data.delta.rxErrors} TX=${data.delta.txErrors}`
+            );
         }
 
-        if (sample.txDroppedDelta > 0n || sample.rxDroppedDelta > 0n) {
-            this.output.log(`  DROPPED: TX=${sample.txDroppedDelta.toString()}, RX=${sample.rxDroppedDelta.toString()}`);
+        if (data.delta.rxDropped > 0n || data.delta.txDropped > 0n) {
+            console.log(
+                `  Dropped: RX=${data.delta.rxDropped} TX=${data.delta.txDropped}`
+            );
         }
 
-        for (const alert of sample.alerts || []) {
-            const value = alert.rate !== undefined
-                ? `${monitor.formatBytes(alert.rate)}/s`
-                : `${alert.count.toString()} packets`;
-            this.output.log(`  ALERT: ${alert.type} DETECTED (${value})`);
-        }
-
-        if (sample.txRate === 0n && sample.rxRate === 0n) {
-            this.output.log('  No network activity');
-        }
-
-        if ((sample.txRate > 0n || sample.rxRate > 0n) && (sample.txPacketRate + sample.rxPacketRate) > 0n) {
-            const totalBytes = Number(sample.txRate + sample.rxRate);
-            const totalPackets = Number(sample.txPacketRate + sample.rxPacketRate);
-            const efficiency = totalPackets > 0 ? Math.round(totalBytes / totalPackets) : 0;
-            this.output.log(`  Avg packet size: ${efficiency} bytes`);
-        }
-
-        this.output.log('');
+        console.log('');
     }
 
-    renderSummary(summary, monitor) {
-        this.output.log('');
-        this.output.log('='.repeat(50));
-        this.output.log('MONITORING SUMMARY');
-        this.output.log('='.repeat(50));
-        this.output.log(`Interface: ${summary.interface}`);
-        this.output.log(`Duration: ${summary.durationSeconds.toFixed(1)} seconds`);
-        this.output.log(`Samples: ${summary.sampleCount}`);
+    alert(data) {
+        console.log(
+            `ALERT ${data.interface}: ${data.type} ` +
+            `value=${data.value} threshold=${data.threshold}`
+        );
+    }
 
-        if (summary.alerts.length > 0) {
-            this.output.log('');
-            this.output.log(`Alerts triggered: ${summary.alerts.length}`);
+    reset(data) {
+        console.log(
+            `Counter reset on ${data.interface}: ${data.counters.join(', ')}`
+        );
+    }
 
-            const alertTypes = {};
-            for (const alert of summary.alerts) {
-                const timeStr = alert.timestamp.substring(11, 19);
-                alertTypes[alert.type] = (alertTypes[alert.type] || 0) + 1;
-                const value = alert.rate !== undefined
-                    ? `${monitor.formatBytes(BigInt(alert.rate))}/s`
-                    : `${BigInt(alert.count).toString()} packets`;
-                this.output.log(`  [${timeStr}] ${alert.type}: ${value}`);
+    error(data) {
+        console.error(
+            `Monitor error: ${data.interface ?? 'general'}: ` +
+            `${data.message ?? String(data)}`
+        );
+    }
+
+    summary(data) {
+        console.log('');
+        console.log('='.repeat(64));
+        console.log('RXTX MONITOR SUMMARY');
+        console.log('='.repeat(64));
+        console.log(`Active duration: ${data.activeSeconds.toFixed(2)} seconds`);
+        console.log(`Alerts: ${data.alerts}`);
+        console.log(`Errors: ${data.errors}`);
+
+        for (const iface of data.interfaces) {
+            console.log('');
+            console.log(`Interface: ${iface.interface}`);
+            console.log(`Samples: ${iface.samples}`);
+            console.log(`Counter resets: ${iface.resets}`);
+            console.log(`RX total: ${formatBytes(iface.totals.rxBytes)}`);
+            console.log(`TX total: ${formatBytes(iface.totals.txBytes)}`);
+            console.log(
+                `RX average: ${formatRate(iface.averageRates.rxBytesPerSecond)}`
+            );
+            console.log(
+                `TX average: ${formatRate(iface.averageRates.txBytesPerSecond)}`
+            );
+            console.log(
+                `RX peak: ${formatRate(iface.peakRates.rxBytesPerSecond)}`
+            );
+            console.log(
+                `TX peak: ${formatRate(iface.peakRates.txBytesPerSecond)}`
+            );
+            console.log(`RX packets: ${iface.totals.rxPackets}`);
+            console.log(`TX packets: ${iface.totals.txPackets}`);
+            console.log(
+                `Errors: RX=${iface.totals.rxErrors} TX=${iface.totals.txErrors}`
+            );
+            console.log(
+                `Dropped: RX=${iface.totals.rxDropped} TX=${iface.totals.txDropped}`
+            );
+
+            if (iface.averagePacketSize !== null) {
+                console.log(
+                    `Average packet size: ${iface.averagePacketSize.toFixed(1)} B`
+                );
             }
-
-            this.output.log('');
-            this.output.log('Alert summary:');
-            for (const [type, count] of Object.entries(alertTypes)) {
-                this.output.log(`  ${type}: ${count} times`);
-            }
-        } else {
-            this.output.log('');
-            this.output.log('No alerts triggered');
         }
 
-        if (summary.sessionTotals) {
-            this.output.log('');
-            this.output.log('SESSION TOTALS:');
-            this.output.log(`  TX: ${monitor.formatBytes(BigInt(summary.sessionTotals.txBytes))}`);
-            this.output.log(`     Packets: ${BigInt(summary.sessionTotals.txPackets).toLocaleString()}`);
-            this.output.log(`     Errors: ${BigInt(summary.sessionTotals.txErrors).toLocaleString()}`);
-            this.output.log(`     Dropped: ${BigInt(summary.sessionTotals.txDropped).toLocaleString()}`);
-            this.output.log(`  RX: ${monitor.formatBytes(BigInt(summary.sessionTotals.rxBytes))}`);
-            this.output.log(`     Packets: ${BigInt(summary.sessionTotals.rxPackets).toLocaleString()}`);
-            this.output.log(`     Errors: ${BigInt(summary.sessionTotals.rxErrors).toLocaleString()}`);
-            this.output.log(`     Dropped: ${BigInt(summary.sessionTotals.rxDropped).toLocaleString()}`);
-        }
-
-        if (summary.interfaceTotals) {
-            this.output.log('');
-            this.output.log(`CURRENT INTERFACE COUNTERS FOR ${summary.interface}:`);
-            this.output.log(`  TX: ${monitor.formatBytes(BigInt(summary.interfaceTotals.txBytes))}`);
-            this.output.log(`     Packets: ${BigInt(summary.interfaceTotals.txPackets).toLocaleString()}`);
-            this.output.log(`     Errors: ${BigInt(summary.interfaceTotals.txErrors).toLocaleString()}`);
-            this.output.log(`     Dropped: ${BigInt(summary.interfaceTotals.txDropped).toLocaleString()}`);
-            this.output.log(`  RX: ${monitor.formatBytes(BigInt(summary.interfaceTotals.rxBytes))}`);
-            this.output.log(`     Packets: ${BigInt(summary.interfaceTotals.rxPackets).toLocaleString()}`);
-            this.output.log(`     Errors: ${BigInt(summary.interfaceTotals.rxErrors).toLocaleString()}`);
-            this.output.log(`     Dropped: ${BigInt(summary.interfaceTotals.rxDropped).toLocaleString()}`);
-        }
-
-        if (summary.combinedSession) {
-            this.output.log('');
-            this.output.log('SESSION AGGREGATES:');
-            this.output.log(`  Data: ${monitor.formatBytes(BigInt(summary.combinedSession.totalBytes))}`);
-            this.output.log(`  Packets: ${BigInt(summary.combinedSession.totalPackets).toLocaleString()}`);
-            this.output.log(`  Errors: ${BigInt(summary.combinedSession.totalErrors).toLocaleString()}`);
-            this.output.log(`  Dropped: ${BigInt(summary.combinedSession.totalDropped).toLocaleString()}`);
-        }
-
-        if (summary.averageRates) {
-            this.output.log('');
-            this.output.log('AVERAGE SESSION RATES:');
-            this.output.log(`  TX: ${monitor.formatBytes(summary.averageRates.txBytesPerSecond)}/s`);
-            this.output.log(`  RX: ${monitor.formatBytes(summary.averageRates.rxBytesPerSecond)}/s`);
-        }
-
-        if (summary.averagePacketSize !== null) {
-            this.output.log(`  Avg packet size: ${Math.round(summary.averagePacketSize)} bytes`);
-        }
-
-        if (summary.errorRatePercent !== null) {
-            this.output.log(`  Error rate: ${summary.errorRatePercent.toFixed(4)}%`);
-        }
+        console.log('='.repeat(64));
     }
 }
 
 async function listInterfaces() {
-    try {
-        const interfacesPath = '/sys/class/net';
-        await fs.promises.access(interfacesPath);
+    const names = await fs.readdir('/sys/class/net');
+    const results = [];
 
-        const interfaces = await fs.promises.readdir(interfacesPath);
-        const validInterfaces = [];
-
-        for (const iface of interfaces) {
-            try {
-                const ifacePath = path.posix.join(interfacesPath, iface);
-                const stats = await fs.promises.stat(ifacePath);
-                if (stats.isDirectory()) {
-                    validInterfaces.push(iface);
-                }
-            } catch (_) {
-            }
-        }
-
-        console.log(`Available interfaces (${validInterfaces.length}):`);
-        validInterfaces.forEach(iface => console.log(`  - ${iface}`));
-        return validInterfaces;
-    } catch (error) {
-        console.log('Cannot list interfaces:', error.message);
-        return [];
+    for (const name of names.sort()) {
+        const iface = new InterfaceMonitor(name, {});
+        results.push(await iface.readMetadata());
     }
+
+    return results;
 }
 
-async function validateInterface(interfaceName) {
-    try {
-        const monitor = new NetworkMonitor(interfaceName);
-        return await monitor.interfaceExists();
-    } catch (_) {
-        return false;
-    }
-}
-
-function validatePositiveNumber(value, name, min = 0) {
-    const num = parseInt(value, 10);
-    if (Number.isNaN(num) || num < min) {
-        throw new Error(`${name} must be a number >= ${min}`);
-    }
-    return num;
-}
-
-function parseArgs(args) {
-    if (args.length < 1 || args.includes('--help') || args.includes('-h')) {
-        return { help: true };
-    }
-
-    if (args.includes('--list') || args.includes('-l')) {
-        return { list: true };
-    }
-
-    const interfaceName = args[0];
-    let duration = 0;
-    let highTrafficThresholdMb = 50;
-    let errorThreshold = 1000;
-    let dropThreshold = 100;
-    let sampleInterval = 1000;
-    let alertCooldown = 5000;
-    let outputJson = false;
-
-    for (let i = 1; i < args.length; i++) {
-        if (args[i] === '--threshold' && args[i + 1]) {
-            highTrafficThresholdMb = validatePositiveNumber(args[i + 1], 'Threshold', 1);
-            i++;
-        } else if (args[i] === '--errors' && args[i + 1]) {
-            errorThreshold = validatePositiveNumber(args[i + 1], 'Error threshold', 0);
-            i++;
-        } else if (args[i] === '--drops' && args[i + 1]) {
-            dropThreshold = validatePositiveNumber(args[i + 1], 'Drop threshold', 0);
-            i++;
-        } else if (args[i] === '--interval' && args[i + 1]) {
-            sampleInterval = validatePositiveNumber(args[i + 1], 'Sample interval', 100);
-            i++;
-        } else if (args[i] === '--cooldown' && args[i + 1]) {
-            alertCooldown = validatePositiveNumber(args[i + 1], 'Alert cooldown', 100);
-            i++;
-        } else if (args[i] === '--json') {
-            outputJson = true;
-        } else if (/^\d+$/.test(args[i])) {
-            duration = validatePositiveNumber(args[i], 'Duration', 0);
-        }
-    }
-
-    return {
-        help: false,
+function parseArgs(argv) {
+    const options = {
+        interfaces: [],
+        duration: 0,
+        interval: 1000,
+        thresholdBytes: 50 * 1024 * 1024,
+        errorThreshold: 1000,
+        dropThreshold: 100,
+        cooldown: 5000,
+        historySize: 60,
+        maxFailures: 5,
+        json: false,
+        ndjson: false,
         list: false,
-        interfaceName,
-        duration,
-        highTrafficThresholdMb,
-        errorThreshold,
-        dropThreshold,
-        sampleInterval,
-        alertCooldown,
-        outputJson
+        help: false,
+        version: false
     };
+
+    const numericOptions = {
+        '--interval': ['interval', 100],
+        '--errors': ['errorThreshold', 0],
+        '--drops': ['dropThreshold', 0],
+        '--cooldown': ['cooldown', 0],
+        '--history': ['historySize', 1],
+        '--max-failures': ['maxFailures', 1]
+    };
+
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+
+        if (arg === '--help' || arg === '-h') {
+            options.help = true;
+        } else if (arg === '--version') {
+            options.version = true;
+        } else if (arg === '--list' || arg === '-l') {
+            options.list = true;
+        } else if (arg === '--json') {
+            options.json = true;
+        } else if (arg === '--ndjson') {
+            options.ndjson = true;
+        } else if (arg === '--threshold') {
+            if (++i >= argv.length) {
+                throw new Error('Missing threshold value');
+            }
+
+            options.thresholdBytes = decimal(
+                argv[i],
+                'Traffic threshold'
+            ) * 1024 * 1024;
+        } else if (Object.hasOwn(numericOptions, arg)) {
+            if (++i >= argv.length) {
+                throw new Error(`Missing value for ${arg}`);
+            }
+
+            const [key, minimum] = numericOptions[arg];
+            options[key] = integer(argv[i], arg, minimum);
+        } else if (arg.startsWith('-')) {
+            throw new Error(`Unknown option: ${arg}`);
+        } else if (options.interfaces.length === 0) {
+            options.interfaces = arg.split(',').map(validateInterface);
+        } else if (/^\d+$/.test(arg) && options.duration === 0) {
+            options.duration = integer(arg, 'Duration');
+        } else {
+            throw new Error(`Unexpected argument: ${arg}`);
+        }
+    }
+
+    if (options.json && options.ndjson) {
+        throw new Error('Choose either --json or --ndjson');
+    }
+
+    if (
+        !options.help &&
+        !options.version &&
+        !options.list &&
+        options.interfaces.length === 0
+    ) {
+        throw new Error('No network interfaces specified');
+    }
+
+    options.interfaces = [...new Set(options.interfaces)];
+
+    return options;
 }
 
 function printHelp() {
-    console.log('Network Traffic Monitor');
-    console.log('Usage: node network_monitor.js <interface> [duration_seconds]');
+    console.log(`RXTX Monitor v${VERSION}`);
+    console.log('');
+    console.log('Usage: node main.js <interface[,interface...]> [seconds] [options]');
     console.log('');
     console.log('Options:');
-    console.log('  --help, -h       Show this help message');
-    console.log('  --list, -l       List available interfaces');
-    console.log('  --threshold N    Set high traffic threshold in MB (default: 50)');
-    console.log('  --errors N       Set error threshold (default: 1000)');
-    console.log('  --drops N        Set dropped packet threshold (default: 100)');
-    console.log('  --interval N     Set sample interval in ms (default: 1000)');
-    console.log('  --cooldown N     Set alert cooldown in ms (default: 5000)');
-    console.log('  --json           Output summary in JSON format');
+    console.log('  --list               List network interfaces');
+    console.log('  --interval N         Sampling interval in milliseconds');
+    console.log('  --threshold N        Traffic threshold in MiB/s');
+    console.log('  --errors N           Error threshold per second');
+    console.log('  --drops N            Drop threshold per second');
+    console.log('  --cooldown N         Alert cooldown in milliseconds');
+    console.log('  --history N          Rolling average sample count');
+    console.log('  --max-failures N     Maximum consecutive read failures');
+    console.log('  --json               Final JSON summary');
+    console.log('  --ndjson             Streaming NDJSON events');
+    console.log('  --version            Show version');
+    console.log('  --help               Show help');
     console.log('');
     console.log('Examples:');
-    console.log('  node network_monitor.js eth0 60');
-    console.log('  node network_monitor.js wlan0 --threshold 100 --errors 500');
-    console.log('  node network_monitor.js --list');
+    console.log('  node main.js --list');
+    console.log('  node main.js lo 10');
+    console.log('  node main.js eth0 60 --interval 500');
+    console.log('  node main.js eth0,lo 30 --threshold 10');
+    console.log('  node main.js lo 10 --json');
 }
 
 async function main() {
-    const parsed = parseArgs(process.argv.slice(2));
+    const options = parseArgs(process.argv.slice(2));
 
-    if (parsed.help) {
+    if (options.help) {
         printHelp();
         return;
     }
 
-    if (parsed.list) {
-        await listInterfaces();
+    if (options.version) {
+        console.log(VERSION);
         return;
     }
 
-    if (!await validateInterface(parsed.interfaceName)) {
-        console.error(`Error: Interface '${parsed.interfaceName}' not found or not accessible`);
-        console.log('Use --list to see available interfaces');
-        process.exit(1);
+    if (options.list) {
+        const interfaces = await listInterfaces();
+
+        for (const iface of interfaces) {
+            console.log(
+                `${iface.interface.padEnd(16)} ` +
+                `state=${iface.operstate ?? 'unknown'} ` +
+                `mtu=${iface.mtu ?? 'unknown'} ` +
+                `speed=${iface.speed ?? 'unknown'}`
+            );
+        }
+
+        return;
     }
 
-    const monitor = new NetworkMonitor(parsed.interfaceName, {
-        duration: parsed.duration,
-        highTrafficThreshold: BigInt(parsed.highTrafficThresholdMb) * 1024n * 1024n,
-        errorThreshold: BigInt(parsed.errorThreshold),
-        dropThreshold: BigInt(parsed.dropThreshold),
-        sampleInterval: parsed.sampleInterval,
-        alertCooldown: parsed.alertCooldown
-    });
-
+    const monitor = new NetworkMonitor(options.interfaces, options);
     const renderer = new ConsoleRenderer();
 
-    monitor.on('started', info => renderer.renderStarted(info, monitor));
-    monitor.on('sample', sample => renderer.renderSample(sample, monitor));
-    monitor.on('paused', () => renderer.renderPaused(monitor.interface));
-    monitor.on('resumed', () => renderer.renderResumed(monitor.interface));
-    monitor.on('error', error => renderer.renderError(error));
-
-    let summaryPrinted = false;
-    monitor.on('stopped', summary => {
-        if (summaryPrinted) {
+    function output(type, data) {
+        if (options.ndjson) {
+            process.stdout.write(serialize({ type, data }) + '\n');
             return;
         }
-        summaryPrinted = true;
-        renderer.renderSummary(summary, monitor);
-        if (parsed.outputJson) {
-            console.log(JSON.stringify(monitor.exportToJson(), null, 2));
+
+        if (options.json) {
+            return;
+        }
+
+        if (type === 'started') {
+            renderer.started(data);
+        } else if (type === 'sample') {
+            renderer.sample(data);
+        } else if (type === 'alert') {
+            renderer.alert(data);
+        } else if (type === 'reset') {
+            renderer.reset(data);
+        } else if (type === 'error') {
+            renderer.error(data);
+        } else if (type === 'stopped') {
+            renderer.summary(data);
+        }
+    }
+
+    monitor.on('started', data => output('started', data));
+    monitor.on('sample', data => output('sample', data));
+    monitor.on('alert', data => output('alert', data));
+    monitor.on('reset', data => output('reset', data));
+    monitor.on('monitorError', data => output('error', data));
+
+    monitor.on('stopped', data => {
+        if (options.json) {
+            console.log(serialize(data));
+        } else {
+            output('stopped', data);
         }
     });
 
-    const shutdown = async () => {
+    let shuttingDown = false;
+
+    async function shutdown() {
+        if (shuttingDown) {
+            return;
+        }
+
+        shuttingDown = true;
+
         try {
             await monitor.stop();
-        } finally {
-            process.exit(0);
+        } catch (error) {
+            console.error(error.message);
+            process.exitCode = 1;
         }
-    };
+    }
 
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
-    try {
-        await monitor.start();
-    } catch (error) {
-        console.error('Error:', error.message);
-        process.exit(1);
-    }
+    await monitor.start();
 }
 
 if (require.main === module) {
     main().catch(error => {
-        console.error('Fatal error:', error.message);
-        process.exit(1);
+        console.error(`Error: ${error.message}`);
+        process.exitCode = 1;
     });
 }
 
 module.exports = {
+    InterfaceMonitor,
     NetworkMonitor,
-    ConsoleRenderer
+    ConsoleRenderer,
+    parseArgs,
+    calculateDelta,
+    formatBytes
 };
